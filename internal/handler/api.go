@@ -29,7 +29,7 @@ func bearerToToken(v string) string {
 func (h *APIHandler) HandleModels(w http.ResponseWriter, r *http.Request) {
 	ideToken := bearerToToken(r.Header.Get("Authorization"))
 
-	models, err := h.Client.ListModels(ideToken)
+	models, err := h.Client.ListModels(r.Context(), ideToken)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
@@ -63,8 +63,10 @@ func (h *APIHandler) HandleChatCompletions(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	w.Header().Set("X-Proxied-Model", req.Model)
+
 	// Forward to Trae Client
-	resp, err := h.Client.ChatCompletionStream(ideToken, req.Model, req.Messages)
+	resp, err := h.Client.ChatCompletionStream(r.Context(), ideToken, req.Model, req.Messages)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return

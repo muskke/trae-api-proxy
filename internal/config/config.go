@@ -22,6 +22,8 @@ type Config struct {
 	MachineID      string
 	OSVersion      string
 	APIBaseURL     string
+	Port           string
+	Locale         string
 }
 
 func Load() *Config {
@@ -40,5 +42,7 @@ func Load() *Config {
 		MachineID:      os.Getenv("TRAE_MACHINE_ID"),
 		OSVersion:      os.Getenv("TRAE_OS_VERSION"),
 		APIBaseURL:     utils.EnvOrDefault("TRAE_API_BASE_URL", DefaultTraeBaseURL),
+		Port:           utils.EnvOrDefault("PORT", "8000"),
+		Locale:         utils.EnvOrDefault("TRAE_LOCALE", "zh-cn"),
 	}
 }

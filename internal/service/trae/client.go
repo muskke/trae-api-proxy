@@ -2,8 +2,10 @@ package trae
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"time"
 
@@ -14,11 +16,30 @@ import (
 )
 
 type Client struct {
-	Config *config.Config
+	Config     *config.Config
+	HTTPClient *http.Client
 }
 
 func NewClient(cfg *config.Config) *Client {
-	return &Client{Config: cfg}
+	return &Client{
+		Config: cfg,
+		HTTPClient: &http.Client{
+			Timeout: 0, // No timeout for streaming, handle via context
+			Transport: &http.Transport{
+				Proxy: http.ProxyFromEnvironment,
+				DialContext: (&net.Dialer{
+					Timeout:   30 * time.Second,
+					KeepAlive: 30 * time.Second,
+				}).DialContext,
+				ForceAttemptHTTP2:     true,
+				MaxIdleConns:          100,
+				MaxIdleConnsPerHost:   100,
+				IdleConnTimeout:       90 * time.Second,
+				TLSHandshakeTimeout:   10 * time.Second,
+				ExpectContinueTimeout: 1 * time.Second,
+			},
+		},
+	}
 }
 
 func (c *Client) headers(ideToken string) http.Header {
@@ -38,15 +59,16 @@ func (c *Client) headers(ideToken string) http.Header {
 	return h
 }
 
-func (c *Client) ListModels(ideToken string) ([]openai.Model, error) {
-	req, _ := http.NewRequest(
+func (c *Client) ListModels(ctx context.Context, ideToken string) ([]openai.Model, error) {
+	req, _ := http.NewRequestWithContext(
+		ctx,
 		"GET",
 		c.Config.APIBaseURL+"/api/ide/v1/model_list?type=llm_raw_chat",
 		nil,
 	)
 	req.Header = c.headers(ideToken)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -78,7 +100,7 @@ func (c *Client) ListModels(ideToken string) ([]openai.Model, error) {
 	return models, nil
 }
 
-func (c *Client) ChatCompletionStream(ideToken string, model string, messages []openai.ChatCompletionMessage) (*http.Response, error) {
+func (c *Client) ChatCompletionStream(ctx context.Context, ideToken string, model string, messages []openai.ChatCompletionMessage) (*http.Response, error) {
 	currentTurn := 0
 	for i := 0; i < len(messages)-1; i++ {
 		if messages[i].Role == "user" {
@@ -97,7 +119,7 @@ func (c *Client) ChatCompletionStream(ideToken string, model string, messages []
 			"role":    m.Role,
 			"content": m.Content,
 			"status":  "success",
-			"locale":  "zh-cn",
+			"locale":  c.Config.Locale,
 		})
 	}
 
@@ -115,7 +137,8 @@ func (c *Client) ChatCompletionStream(ideToken string, model string, messages []
 		"user_input":                   lastMsg.Content,
 		"valid_turns":                  []int{},
 		"variables": fmt.Sprintf(
-			`{"locale":"zh-cn","current_time":"%s"}`,
+			`{"locale":"%s","current_time":"%s"}`,
+			c.Config.Locale,
 			time.Now().Format("20060102 15:04:05 Monday"),
 		),
 	}
@@ -125,12 +148,13 @@ func (c *Client) ChatCompletionStream(ideToken string, model string, messages []
 		return nil, err
 	}
 
-	httpReq, _ := http.NewRequest(
+	httpReq, _ := http.NewRequestWithContext(
+		ctx,
 		"POST",
 		c.Config.APIBaseURL+"/api/ide/v1/chat",
 		bytes.NewReader(body),
 	)
 	httpReq.Header = c.headers(ideToken)
 
-	return http.DefaultClient.Do(httpReq)
+	return c.HTTPClient.Do(httpReq)
 }
