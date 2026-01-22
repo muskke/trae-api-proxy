@@ -24,7 +24,7 @@ func main() {
 	traeClient := trae.NewClient(cfg)
 
 	// 3. Initialize Handlers
-	h := handler.NewAPIHandler(traeClient)
+	h := handler.NewAPIHandler(cfg, traeClient)
 
 	// 4. Setup Routes
 	mux := http.NewServeMux()

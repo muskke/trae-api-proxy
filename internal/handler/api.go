@@ -10,17 +10,22 @@ import (
 	"strings"
 	"time"
 
+	"github.com/muskke/trae-api-proxy/internal/config"
 	"github.com/muskke/trae-api-proxy/internal/service/trae"
 
 	"github.com/openai/openai-go"
 )
 
 type APIHandler struct {
+	Config *config.Config
 	Client *trae.Client
 }
 
-func NewAPIHandler(client *trae.Client) *APIHandler {
-	return &APIHandler{Client: client}
+func NewAPIHandler(cfg *config.Config, client *trae.Client) *APIHandler {
+	return &APIHandler{
+		Config: cfg,
+		Client: client,
+	}
 }
 
 func bearerToToken(v string) string {
@@ -28,9 +33,19 @@ func bearerToToken(v string) string {
 }
 
 func (h *APIHandler) HandleModels(w http.ResponseWriter, r *http.Request) {
-	ideToken := bearerToToken(r.Header.Get("Authorization"))
+	reqToken := bearerToToken(r.Header.Get("Authorization"))
 
-	models, err := h.Client.ListModels(r.Context(), ideToken)
+	// Authentication check
+	if h.Config.AuthToken != "" {
+		if reqToken != h.Config.AuthToken {
+			http.Error(w, "Unauthorized", 401)
+			return
+		}
+		// If auth matches, we use the internal IDE Token for upstream
+		reqToken = h.Config.IdeToken
+	}
+
+	models, err := h.Client.ListModels(r.Context(), reqToken)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
@@ -44,7 +59,17 @@ func (h *APIHandler) HandleModels(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *APIHandler) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
-	ideToken := bearerToToken(r.Header.Get("Authorization"))
+	reqToken := bearerToToken(r.Header.Get("Authorization"))
+
+	// Authentication check
+	if h.Config.AuthToken != "" {
+		if reqToken != h.Config.AuthToken {
+			http.Error(w, "Unauthorized", 401)
+			return
+		}
+		// If auth matches, we use the internal IDE Token for upstream
+		reqToken = h.Config.IdeToken
+	}
 
 	// We decode into a map first or the openai struct.
 	// Since openai-go request structs often have specific pointer fields,
@@ -67,7 +92,7 @@ func (h *APIHandler) HandleChatCompletions(w http.ResponseWriter, r *http.Reques
 	w.Header().Set("X-Proxied-Model", req.Model)
 
 	// Forward to Trae Client
-	resp, err := h.Client.ChatCompletion(r.Context(), ideToken, req.Model, req.Messages, req.Stream)
+	resp, err := h.Client.ChatCompletion(r.Context(), reqToken, req.Model, req.Messages, req.Stream)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return

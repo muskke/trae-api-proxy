@@ -11,6 +11,7 @@ const (
 )
 
 type Config struct {
+	AuthToken      string
 	AppID          string
 	DeviceBrand    string
 	DeviceCPU      string
@@ -24,6 +25,7 @@ type Config struct {
 	APIBaseURL     string
 	Port           string
 	Locale         string
+	IdeToken       string
 }
 
 func Load() *Config {
@@ -36,12 +38,14 @@ func Load() *Config {
 		DeviceCPU:      os.Getenv("TRAE_DEVICE_CPU"),
 		DeviceID:       os.Getenv("TRAE_DEVICE_ID"),
 		DeviceType:     os.Getenv("TRAE_DEVICE_TYPE"),
+		IdeToken:       os.Getenv("TRAE_IDE_TOKEN"),
 		IDEVersion:     os.Getenv("TRAE_IDE_VERSION"),
 		IDEVersionCode: os.Getenv("TRAE_IDE_VERSION_CODE"),
 		IDEVersionType: os.Getenv("TRAE_IDE_VERSION_TYPE"),
 		MachineID:      os.Getenv("TRAE_MACHINE_ID"),
 		OSVersion:      os.Getenv("TRAE_OS_VERSION"),
 		APIBaseURL:     utils.EnvOrDefault("TRAE_API_BASE_URL", DefaultTraeBaseURL),
+		AuthToken:      utils.EnvOrDefault("AUTH_TOKEN", ""),
 		Port:           utils.EnvOrDefault("PORT", "8000"),
 		Locale:         utils.EnvOrDefault("TRAE_LOCALE", "zh-cn"),
 	}
