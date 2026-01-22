@@ -1,2 +1,26 @@
-.env
+# Binaries
 *.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Generic
+.DS_Store
+Thumbs.db
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Go
+vendor/
+go.work
+go.work.sum
+
+# Project
+.env

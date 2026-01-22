@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -66,40 +67,56 @@ func (h *APIHandler) HandleChatCompletions(w http.ResponseWriter, r *http.Reques
 	w.Header().Set("X-Proxied-Model", req.Model)
 
 	// Forward to Trae Client
-	resp, err := h.Client.ChatCompletionStream(r.Context(), ideToken, req.Model, req.Messages)
+	resp, err := h.Client.ChatCompletion(r.Context(), ideToken, req.Model, req.Messages, req.Stream)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
 	defer resp.Body.Close()
 
-	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache, no-transform")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no")
+	var flusher http.Flusher
+	if req.Stream {
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache, no-transform")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("X-Accel-Buffering", "no")
 
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, "Streaming not supported", 500)
-		return
+		var ok bool
+		flusher, ok = w.(http.Flusher)
+		if !ok {
+			http.Error(w, "Streaming not supported", 500)
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		flusher.Flush()
 	}
-
-	w.WriteHeader(http.StatusOK)
-	flusher.Flush()
 
 	reader := bufio.NewReader(resp.Body)
 
-	// Use openai-go types for response
+	// Common response structure
 	chunk := openai.ChatCompletionChunk{
 		Object:  "chat.completion.chunk",
 		Model:   req.Model,
 		Created: time.Now().Unix(),
 	}
 
+	// For non-streaming, we aggregate the content
+	var fullContent strings.Builder
+	var completionID string
+
 	eventName := ""
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			if !req.Stream {
+				log.Printf("error reading stream for aggregation: %v", err)
+				http.Error(w, err.Error(), 500)
+				return
+			}
 			return
 		}
 
@@ -118,9 +135,11 @@ func (h *APIHandler) HandleChatCompletions(w http.ResponseWriter, r *http.Reques
 		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 
 		if data == "[DONE]" {
-			fmt.Fprintf(w, "data: [DONE]\n\n")
-			flusher.Flush()
-			return
+			if req.Stream {
+				fmt.Fprintf(w, "data: [DONE]\n\n")
+				flusher.Flush()
+			}
+			break
 		}
 
 		var evtData map[string]any
@@ -132,38 +151,71 @@ func (h *APIHandler) HandleChatCompletions(w http.ResponseWriter, r *http.Reques
 		switch eventName {
 		case "metadata":
 			if id, ok := evtData["prompt_completion_id"]; ok {
-				chunk.ID = fmt.Sprint(id)
+				completionID = fmt.Sprint(id)
+				chunk.ID = completionID
 			}
 
 		case "output":
 			if response, ok := evtData["response"].(string); ok {
+				if req.Stream {
+					chunk.Choices = []openai.ChatCompletionChunkChoice{
+						{
+							Delta: openai.ChatCompletionChunkChoiceDelta{
+								Role:    "assistant",
+								Content: response,
+							},
+						},
+					}
+					out, _ := json.Marshal(chunk)
+					fmt.Fprintf(w, "data: %s\n\n", out)
+					flusher.Flush()
+				} else {
+					fullContent.WriteString(response)
+				}
+			}
+
+		case "done":
+			if req.Stream {
 				chunk.Choices = []openai.ChatCompletionChunkChoice{
 					{
 						Delta: openai.ChatCompletionChunkChoiceDelta{
-							Role:    "assistant",
-							Content: response,
+							Role: "assistant",
 						},
+						FinishReason: "stop",
 					},
 				}
 				out, _ := json.Marshal(chunk)
 				fmt.Fprintf(w, "data: %s\n\n", out)
+				fmt.Fprintf(w, "data: [DONE]\n\n")
 				flusher.Flush()
 			}
+			// For non-streaming, we break here and return the aggregated response
+			goto Finish
+		}
+	}
 
-		case "done":
-			chunk.Choices = []openai.ChatCompletionChunkChoice{
+Finish:
+	if !req.Stream {
+		resp := openai.ChatCompletion{
+			ID:      completionID,
+			Object:  "chat.completion",
+			Created: time.Now().Unix(),
+			Model:   req.Model,
+			Choices: []openai.ChatCompletionChoice{
 				{
-					Delta: openai.ChatCompletionChunkChoiceDelta{
-						Role: "assistant",
+					Index: 0,
+					Message: openai.ChatCompletionMessage{
+						Role:    "assistant",
+						Content: fullContent.String(),
 					},
 					FinishReason: "stop",
 				},
-			}
-			out, _ := json.Marshal(chunk)
-			fmt.Fprintf(w, "data: %s\n\n", out)
-			fmt.Fprintf(w, "data: [DONE]\n\n")
-			flusher.Flush()
-			return
+			},
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			log.Printf("error encoding response: %v", err)
 		}
 	}
 }

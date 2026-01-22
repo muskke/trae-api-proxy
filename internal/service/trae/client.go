@@ -100,7 +100,7 @@ func (c *Client) ListModels(ctx context.Context, ideToken string) ([]openai.Mode
 	return models, nil
 }
 
-func (c *Client) ChatCompletionStream(ctx context.Context, ideToken string, model string, messages []openai.ChatCompletionMessage) (*http.Response, error) {
+func (c *Client) ChatCompletion(ctx context.Context, ideToken string, model string, messages []openai.ChatCompletionMessage, stream bool) (*http.Response, error) {
 	currentTurn := 0
 	for i := 0; i < len(messages)-1; i++ {
 		if messages[i].Role == "user" {
@@ -133,7 +133,7 @@ func (c *Client) ChatCompletionStream(ctx context.Context, ideToken string, mode
 		"is_preset":                    true,
 		"model_name":                   model,
 		"session_id":                   uuid.NewString(),
-		"stream":                       true,
+		"stream":                       stream,
 		"user_input":                   lastMsg.Content,
 		"valid_turns":                  []int{},
 		"variables": fmt.Sprintf(
