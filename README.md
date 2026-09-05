@@ -4,12 +4,15 @@
 
 一个轻量、单账号、零第三方 Go 运行依赖的 TRAE → OpenAI Chat Completions 兼容代理。
 
-**v0.4.1 修复了 v0.4.0 浏览器登录在 TRAE Global 上失败的问题。** v0.4.0 仍沿用了旧的 China/SOLO 直连授权 URL；当前版本默认面向 `trae.ai` 的标准 TRAE Global 登录，先通过 LoginGuidance 获取实际登录域名，再使用 PKCE S256 完成浏览器授权和 AuthCode 换票。首次登录完成后，代理继续负责 access token 刷新、refresh token 轮换和 401/403 单次自愈重试。
+**v0.4.2 修复了 v0.4.0 浏览器登录在 TRAE Global 上失败的问题。** v0.4.0 仍沿用了旧的 China/SOLO 直连授权 URL；当前版本默认面向 `trae.ai` 的标准 TRAE Global 登录，先通过 LoginGuidance 获取实际登录域名，再使用 PKCE S256 完成浏览器授权和 AuthCode 换票。首次登录完成后，代理继续负责 access token 刷新、refresh token 轮换和 401/403 单次自愈重试。
 
 > 如果你使用的是 TRAE Global IDE，通常只需要保持 `TRAE_OAUTH_PLATFORM=global`，不要再手工指定旧的 `trae.cn`、SOLO client id 或 v0.4.0 登录 URL。
 
-## ✨ v0.4.1 重点
+## ✨ v0.4.2 重点
 
+- **Global 对话路由修复**：标准 TRAE 使用 `chat_v3`，只有 `global-solo` / `cn-solo` 使用 `solo_work_lite`。
+- **Global Core Host 修复**：SG 默认 `https://coresg-normal.trae.ai`，US 默认 `https://coreva-normal.trae.ai`，旧 v0.4.1 自动生成的 SG/US host 启动时自动迁移。
+- **真实回调区域优先**：优先采用 callback 的 `userRegion` / `host` 元数据，避免仅靠登录域名推断区域。
 - **Global TRAE 默认模式**：默认 `TRAE_OAUTH_PLATFORM=global`，标准 TRAE 使用 Global 登录与账号接口。
 - **LoginGuidance**：`/auth/login` 不再硬编码旧授权域名，而是先获取当前可用 LoginHost。
 - **PKCE S256**：授权 URL 包含 `code_challenge` / `code_challenge_method=S256`，本地保存一次性 verifier 用于换票。
@@ -93,7 +96,7 @@ TRAE_OAUTH_PLUGIN_VERSION=2.3.62834
 TRAE_IDE_VERSION=0.1.52
 ```
 
-**Global 用户应删除这些覆盖项，或改用新版 `.env.example`。** 否则环境变量优先级会主动覆盖 v0.4.1 的 Global/自动发现逻辑。
+**Global 用户应删除这些覆盖项，或改用新版 `.env.example`。** 否则环境变量优先级会主动覆盖 v0.4.2 的 Global/自动发现逻辑。
 
 ### 2. 启动
 
@@ -326,7 +329,7 @@ TRAE_MODEL_ALIASES=sonnet=glm-5.2;fast=glm-5-turbo
 | `TRAE_OAUTH_REFRESH_INTERVAL` | `15m` | 后台检查间隔 |
 | `TRAE_OAUTH_LOGIN_TTL` | `10m` | 一次性登录会话有效期 |
 | `TRAE_UPSTREAM_MODE` | `auto` | `auto` / `solo` / `legacy` |
-| `TRAE_API_BASE_URL` | Global: `https://trae-api-sg.mchost.guru` | OAuth 会话可按区域动态选择 SG/US/CN |
+| `TRAE_API_BASE_URL` | Global SG: `https://coresg-normal.trae.ai` | OAuth 会话可按区域动态选择 SG/US/CN；显式自定义值保持优先 |
 | `TRAE_DEFAULT_MODEL` | `glm-5.2` | 默认模型 |
 | `TRAE_MODEL_CACHE_TTL` | `1h` | 模型列表缓存 |
 | `TRAE_REQUEST_TIMEOUT` | `120s` | 短 JSON 请求总超时 |
@@ -471,8 +474,17 @@ TRAE_OAUTH_PLATFORM=global
 
 - 当前专注 Chat Completions，不实现 embeddings、images、audio、OpenAI Responses API 或多账号池。
 - access token 可以自动刷新，但 refresh token 自身仍可能过期、被撤销或因账号状态变化失效；此时需要重新访问 `/auth/login`。
-- TRAE 登录/Agent 上游并非公开稳定 API。v0.4.1 已把区域、产品、LoginGuidance、Client ID、路径和客户端版本尽可能动态化/可配置，但后续仍可能随 IDE 更新调整。
+- TRAE 登录/Agent 上游并非公开稳定 API。v0.4.2 已把区域、产品、LoginGuidance、Client ID、路径和客户端版本尽可能动态化/可配置，但后续仍可能随 IDE 更新调整。
 
 ## 📄 License
 
 MIT，见 [LICENSE](LICENSE)。
+
+
+## v0.4.2 Global chat routing fix
+
+TRAE Global and TRAE SOLO share the `/api/agent/v3/llm_utils_chat` endpoint but do not use the same `function` value. v0.4.2 routes standard Global/CN TRAE model calls through `chat_v3`, while `global-solo`/`cn-solo` continue using `solo_work_lite`. Model discovery uses the same product-aware function, and requested model IDs are matched case-insensitively against the live model list.
+
+For Global accounts, the default core endpoint is now `https://coresg-normal.trae.ai` for SG and `https://coreva-normal.trae.ai` for US. Existing v0.4.1 managed credentials that contain the generated `trae-api-sg.mchost.guru` or `trae-api-us.mchost.guru` values are migrated automatically on startup; custom `TRAE_API_BASE_URL` overrides are preserved.
+
+After upgrading from v0.4.1, a new browser login is not required. Restart the proxy and retry `/v1/models` and `/v1/chat/completions`.

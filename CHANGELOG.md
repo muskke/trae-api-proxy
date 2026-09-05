@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.4.2
+
+- Fix Global TRAE model/chat requests to use `chat_v3` instead of the SOLO-only `solo_work_lite` function.
+- Route Global SG/US traffic to the current core hosts (`coresg-normal.trae.ai` / `coreva-normal.trae.ai`).
+- Migrate v0.4.1 generated SG/US core-host values without overwriting explicit custom upstream URLs.
+- Use callback `userRegion` and `host` routing metadata when present.
+- Canonicalize requested model casing from the live model list and add request trace headers used by current TRAE clients.
+
 All notable changes to this project are documented here.
 
 ## [0.4.1] - 2026-09-05
