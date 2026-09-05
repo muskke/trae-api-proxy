@@ -2,6 +2,34 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.0] - 2026-09-05
+
+### Added
+
+- Managed TRAE browser-login flow through `/auth/login` and one-time `/auth/callback/{state}` callbacks, with a dedicated localhost callback listener (default port `18080`).
+- Persistent OAuth credential storage with access token, rotating refresh token, expiry metadata, UID, machine ID, and device ID.
+- Proactive access-token refresh before expiry and configurable background refresh checks.
+- Single-flight refresh locking so concurrent API requests do not rotate the same refresh token multiple times.
+- One-time automatic recovery for upstream `401` / `403`: force refresh, invalidate model cache, and retry the original request once.
+- `/auth/status`, `/auth/refresh`, and `/auth/logout` lifecycle endpoints without exposing raw credentials.
+- Re-authentication status when the refresh session expires or can no longer be renewed.
+- Offline tests for browser callback exchange, credential persistence, refresh rotation/concurrency/failure behavior, 401 recovery, and OAuth device identity propagation.
+
+### Changed
+
+- `TRAE_AUTH_MODE=auto` is now the default and prefers managed OAuth credentials, then the legacy static `TRAE_IDE_TOKEN`, then request passthrough where applicable.
+- `AUTH_TOKEN` no longer requires a static `TRAE_IDE_TOKEN`; it can be used with managed OAuth authentication.
+- OAuth credentials are atomically persisted with private filesystem permissions and excluded from Git/Docker build contexts.
+- Provider error response bodies are not copied into public auth status/errors.
+- Local browser login accepts loopback traffic and Docker's private bridge-to-loopback-host pattern while rejecting public Host-header spoofing.
+- Docker Compose now persists `/app/data` in a named volume, publishes the OAuth callback port on host localhost, and grants the unprivileged app user write access to the data directory.
+
+### Compatibility
+
+- `TRAE_AUTH_MODE=token` preserves the v0.3 static-token workflow.
+- Existing `TRAE_IDE_TOKEN`, UID, machine-ID, device-ID, model, SOLO/legacy, and OpenAI client settings remain supported.
+- OAuth host, console URL, client ID, exchange/user-info paths, callback base, plugin version, refresh skew, refresh interval, and login TTL are configurable for future upstream changes.
+
 ## [0.3.0] - 2026-09-05
 
 ### Added
