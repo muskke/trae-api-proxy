@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-func TestPrepareSoloBodyNormalizesOpenAIRequest(t *testing.T) {
+func TestPrepareCurrentBodyNormalizesOpenAIRequest(t *testing.T) {
 	src := []byte(`{
 		"model":"ignored",
 		"messages":[
@@ -19,7 +19,7 @@ func TestPrepareSoloBodyNormalizesOpenAIRequest(t *testing.T) {
 		"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{"q":{"type":"string"}}}}}]
 	}`)
 
-	out, err := prepareSoloBody(src, "glm-5.2")
+	out, err := prepareCurrentBody(src, "glm-5.2", standardChatFunction)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -27,7 +27,7 @@ func TestPrepareSoloBodyNormalizesOpenAIRequest(t *testing.T) {
 	if err := json.Unmarshal(out, &got); err != nil {
 		t.Fatal(err)
 	}
-	if got["function"] != soloFunction || got["config_name"] != "glm-5.2" || got["model"] != "glm-5.2" {
+	if got["function"] != standardChatFunction || got["config_name"] != "glm-5.2" || got["model"] != "glm-5.2" {
 		t.Fatalf("unexpected model/function mapping: %#v", got)
 	}
 	if stream, _ := got["stream"].(bool); !stream {
@@ -66,9 +66,9 @@ func TestPrepareSoloBodyNormalizesOpenAIRequest(t *testing.T) {
 	}
 }
 
-func TestPrepareSoloBodyNoneSuppressesTools(t *testing.T) {
+func TestPrepareCurrentBodyNoneSuppressesTools(t *testing.T) {
 	src := []byte(`{"messages":[{"role":"user","content":"x"}],"tools":[{"type":"function","function":{"name":"f","parameters":{}}}],"tool_choice":"none"}`)
-	out, err := prepareSoloBody(src, "glm-5.2")
+	out, err := prepareCurrentBody(src, "glm-5.2", standardChatFunction)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,5 +81,26 @@ func TestPrepareSoloBodyNoneSuppressesTools(t *testing.T) {
 	}
 	if _, ok := got["tool_choice"]; ok {
 		t.Fatal("tool_choice should be removed for none")
+	}
+}
+
+func TestPrepareCurrentBodyAutoOmitsConfigName(t *testing.T) {
+	src := []byte(`{"messages":[{"role":"user","content":"hello"}],"stream":false}`)
+	out, err := prepareCurrentBody(src, "auto", autoChatFunction)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["function"] != autoChatFunction {
+		t.Fatalf("function = %#v", got["function"])
+	}
+	if _, ok := got["config_name"]; ok {
+		t.Fatal("inline_chat must not send config_name")
+	}
+	if _, ok := got["model"]; ok {
+		t.Fatal("inline_chat auto must not send model")
 	}
 }

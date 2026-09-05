@@ -16,11 +16,13 @@ import (
 )
 
 const (
-	soloChatPath   = "/api/agent/v3/llm_utils_chat"
-	soloModelsPath = "/api/ide/v1/get_detail_param"
-	legacyChatPath = "/api/ide/v1/chat"
-	legacyModels   = "/api/ide/v1/model_list?type=llm_raw_chat"
-	soloFunction   = "solo_work_lite"
+	soloChatPath         = "/api/agent/v3/llm_utils_chat"
+	soloModelsPath       = "/api/ide/v1/get_detail_param"
+	legacyChatPath       = "/api/ide/v1/chat"
+	legacyModels         = "/api/ide/v1/model_list?type=llm_raw_chat"
+	standardChatFunction = "chat_v3"
+	soloChatFunction     = "solo_work_lite"
+	autoChatFunction     = "inline_chat"
 )
 
 type Session struct {
@@ -152,6 +154,32 @@ func setIfNotEmpty(h http.Header, key, value string) {
 	}
 }
 
+func currentFunction(session Session, model string) string {
+	if strings.HasSuffix(strings.ToLower(strings.TrimSpace(session.Platform)), "solo") {
+		return soloChatFunction
+	}
+	if strings.EqualFold(strings.TrimSpace(model), "auto") {
+		return autoChatFunction
+	}
+	return standardChatFunction
+}
+
+func (c *Client) canonicalModel(requested string) string {
+	requested = strings.TrimSpace(requested)
+	if requested == "" || strings.EqualFold(requested, "auto") {
+		return requested
+	}
+	c.modelMu.RLock()
+	models := append([]Model(nil), c.modelCache...)
+	c.modelMu.RUnlock()
+	for _, model := range models {
+		if strings.EqualFold(strings.TrimSpace(model.ID), requested) {
+			return model.ID
+		}
+	}
+	return requested
+}
+
 func (c *Client) ListModels(ctx context.Context, session Session) ([]Model, error) {
 	c.modelMu.RLock()
 	if len(c.modelCache) > 0 && time.Since(c.modelCachedAt) < c.Config.ModelCacheTTL {
@@ -198,7 +226,7 @@ func (c *Client) fetchModelsMode(ctx context.Context, session Session, mode stri
 
 	if mode == "solo" {
 		payload := map[string]any{
-			"function":            soloFunction,
+			"function":            currentFunction(session, ""),
 			"config_names":        nil,
 			"need_prompt":         false,
 			"current_config_info": nil,
@@ -241,6 +269,10 @@ func (c *Client) fetchModelsMode(ctx context.Context, session Session, mode stri
 			return nil, fmt.Errorf("decode solo model list: %w", err)
 		}
 		models := make([]Model, 0, len(raw.ConfigInfoList))
+		ownedBy := "trae"
+		if strings.HasSuffix(strings.ToLower(strings.TrimSpace(session.Platform)), "solo") {
+			ownedBy = "trae-solo"
+		}
 		for _, item := range raw.ConfigInfoList {
 			if strings.TrimSpace(item.ConfigName) == "" {
 				continue
@@ -248,7 +280,7 @@ func (c *Client) fetchModelsMode(ctx context.Context, session Session, mode stri
 			models = append(models, Model{
 				ID:            item.ConfigName,
 				Object:        "model",
-				OwnedBy:       "trae-solo",
+				OwnedBy:       ownedBy,
 				DisplayName:   item.DisplayConfig.DisplayName,
 				ContextLength: item.MaxInputTokens,
 			})
@@ -284,6 +316,7 @@ func (c *Client) fetchModelsMode(ctx context.Context, session Session, mode stri
 // protocol. The upstream is always asked for SSE; non-streaming client requests
 // are aggregated by the handler so both modes share the same parser.
 func (c *Client) ChatCompletion(ctx context.Context, session Session, model string, rawBody []byte) (*http.Response, string, error) {
+	model = c.canonicalModel(model)
 	switch c.Config.UpstreamMode {
 	case "solo":
 		resp, err := c.chatMode(ctx, session, model, rawBody, "solo")
@@ -306,7 +339,7 @@ func (c *Client) chatMode(ctx context.Context, session Session, model string, ra
 	var err error
 	path := soloChatPath
 	if mode == "solo" {
-		body, err = prepareSoloBody(rawBody, model)
+		body, err = prepareCurrentBody(rawBody, model, currentFunction(session, model))
 	} else {
 		path = legacyChatPath
 		body, err = prepareLegacyBody(rawBody, model, c.Config.Locale)
@@ -320,6 +353,10 @@ func (c *Client) chatMode(ctx context.Context, session Session, model string, ra
 		return nil, err
 	}
 	req.Header = c.headers(session, "text/event-stream")
+	requestID := newID()
+	req.Header.Set("X-Request-ID", requestID)
+	req.Header.Set("X-Trae-Request-ID", requestID)
+	req.Header.Set("X-Custom-Trace-Id", newID())
 
 	resp, err := c.StreamClient.Do(req)
 	if err != nil {

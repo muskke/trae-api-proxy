@@ -117,6 +117,13 @@ func TestSoloModelResponse(t *testing.T) {
 		if got := r.Header.Get("Accept"); got != "application/json" {
 			t.Errorf("accept = %q", got)
 		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode model request: %v", err)
+		}
+		if body["function"] != standardChatFunction {
+			t.Errorf("model function = %#v", body["function"])
+		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"config_info_list": []any{
 			map[string]any{
 				"config_name":    "glm-5.2",
@@ -138,6 +145,86 @@ func TestSoloModelResponse(t *testing.T) {
 	if len(models) != 1 || models[0].ID != "glm-5.2" || models[0].DisplayName != "GLM 5.2" {
 		t.Fatalf("models = %#v", models)
 	}
+}
+
+func TestCurrentEndpointUsesChatV3ForStandardTRAE(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case soloModelsPath:
+			_ = json.NewEncoder(w).Encode(map[string]any{"config_info_list": []any{map[string]any{"config_name": "DeepSeek-V4-Flash"}}})
+		case soloChatPath:
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode chat body: %v", err)
+			}
+			if body["function"] != standardChatFunction {
+				t.Errorf("function = %#v", body["function"])
+			}
+			if body["config_name"] != "DeepSeek-V4-Flash" || body["model"] != "DeepSeek-V4-Flash" {
+				t.Errorf("model mapping = %#v", body)
+			}
+			if r.Header.Get("X-Request-ID") == "" || r.Header.Get("X-Trae-Request-ID") == "" || r.Header.Get("X-Custom-Trace-Id") == "" {
+				t.Errorf("missing request trace headers: %#v", r.Header)
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "event: output\ndata: {\"response\":\"ok\"}\n\nevent: done\ndata: {}\n\n")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	cfg := testClientConfig(server.URL)
+	cfg.UpstreamMode = "solo"
+	client := NewClient(cfg)
+	defer client.CloseIdleConnections()
+
+	if _, err := client.ListModels(context.Background(), Session{Token: "token", Platform: "global"}); err != nil {
+		t.Fatal(err)
+	}
+	body := []byte(`{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hello"}],"stream":true}`)
+	resp, _, err := client.ChatCompletion(context.Background(), Session{Token: "token", Platform: "global"}, "deepseek-v4-flash", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+}
+
+func TestCurrentEndpointUsesSoloWorkLiteForSoloProduct(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case soloModelsPath:
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body["function"] != soloChatFunction {
+				t.Errorf("models function = %#v", body["function"])
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"config_info_list": []any{map[string]any{"config_name": "glm-5.2"}}})
+		case soloChatPath:
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body["function"] != soloChatFunction {
+				t.Errorf("chat function = %#v", body["function"])
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "event: done\ndata: {}\n\n")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	cfg := testClientConfig(server.URL)
+	cfg.UpstreamMode = "solo"
+	client := NewClient(cfg)
+	defer client.CloseIdleConnections()
+
+	body := []byte(`{"model":"glm-5.2","messages":[{"role":"user","content":"hello"}],"stream":true}`)
+	resp, _, err := client.ChatCompletion(context.Background(), Session{Token: "token", Platform: "global-solo"}, "glm-5.2", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
 }
 
 func TestCanProtocolFallbackOnlyForEndpointMismatch(t *testing.T) {

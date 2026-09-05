@@ -29,7 +29,7 @@ import (
 
 var ErrReauthRequired = errors.New("TRAE login required")
 
-const credentialVersion = 2
+const credentialVersion = 3
 
 type Account struct {
 	UID          string `json:"uid,omitempty"`
@@ -109,6 +109,7 @@ type callbackInfo struct {
 	AuthCode     string
 	LoginHost    string
 	LoginRegion  string
+	APIHost      string
 	UserTag      string
 	UID          string
 	Nickname     string
@@ -583,6 +584,7 @@ func (m *Manager) CompleteLogin(ctx context.Context, state string, query url.Val
 			RefreshToken: info.RefreshToken,
 			ExpiresAt:    info.ExpiresAt,
 			Domain:       domainForPlatform(pending.Platform),
+			APIHost:      info.APIHost,
 			LoginHost:    info.LoginHost,
 			LoginRegion:  info.LoginRegion,
 			Platform:     pending.Platform,
@@ -815,7 +817,7 @@ func (m *Manager) loadCredential() error {
 	if cred.Auth.LoginRegion == "" {
 		cred.Auth.LoginRegion = inferLoginRegion(cred.Auth.LoginHost, cred.Auth.Platform)
 	}
-	if cred.Auth.APIBaseURL == "" {
+	if cred.Auth.APIBaseURL == "" || isLegacyGeneratedCoreHost(cred.Auth.APIBaseURL) {
 		cred.Auth.APIBaseURL = apiBaseURLForRegion(cred.Auth.LoginRegion, cred.Auth.Platform, m.cfg.APIBaseURL)
 	}
 	cred.Version = credentialVersion
@@ -985,7 +987,8 @@ func parseCallback(q url.Values) (callbackInfo, error) {
 		RefreshToken: firstNonEmpty(q.Get("refreshToken"), q.Get("refresh_token"), q.Get("RefreshToken")),
 		AuthCode:     firstNonEmpty(q.Get("authCode"), q.Get("auth_code"), q.Get("AuthCode"), q.Get("authorization_code"), q.Get("code")),
 		LoginHost:    firstNonEmpty(q.Get("loginHost"), q.Get("login_host"), q.Get("LoginHost")),
-		LoginRegion:  strings.ToLower(firstNonEmpty(q.Get("loginRegion"), q.Get("login_region"), q.Get("LoginRegion"))),
+		LoginRegion:  strings.ToLower(firstNonEmpty(q.Get("userRegion"), q.Get("user_region"), q.Get("UserRegion"), q.Get("loginRegion"), q.Get("login_region"), q.Get("LoginRegion"))),
+		APIHost:      firstNonEmpty(q.Get("host"), q.Get("apiHost"), q.Get("api_host"), q.Get("APIHost")),
 		UserTag:      firstNonEmpty(q.Get("userTag"), q.Get("user_tag"), q.Get("UserTag")),
 	}
 	if info.AuthCode == "" {
@@ -1245,23 +1248,42 @@ func domainForPlatform(platform string) string {
 
 func apiBaseURLForRegion(region, platform, fallback string) string {
 	fallback = strings.TrimRight(strings.TrimSpace(fallback), "/")
-	if fallback != "" && !strings.Contains(strings.ToLower(fallback), "trae-api-") {
+	if fallback != "" && !isKnownGeneratedCoreHost(fallback) {
 		return fallback
 	}
 	if strings.HasPrefix(platform, "cn") || strings.EqualFold(region, "cn") {
-		return "https://trae-api-cn.mchost.guru"
+		return config.DefaultTraeCNBaseURL
 	}
 	switch strings.ToLower(strings.TrimSpace(region)) {
 	case "us", "usttp", "us_ttp", "us-ttp":
-		return "https://trae-api-us.mchost.guru"
+		return config.DefaultTraeUSBaseURL
 	case "sg", "row", "global", "":
-		return "https://trae-api-sg.mchost.guru"
+		return config.DefaultTraeBaseURL
 	default:
-		if strings.TrimSpace(fallback) != "" {
+		if fallback != "" && !isLegacyGeneratedCoreHost(fallback) {
 			return fallback
 		}
-		return "https://trae-api-sg.mchost.guru"
+		return config.DefaultTraeBaseURL
 	}
+}
+
+func isKnownGeneratedCoreHost(raw string) bool {
+	raw = strings.TrimRight(strings.ToLower(strings.TrimSpace(raw)), "/")
+	switch raw {
+	case strings.ToLower(config.DefaultTraeBaseURL),
+		strings.ToLower(config.DefaultTraeUSBaseURL),
+		strings.ToLower(config.DefaultTraeCNBaseURL),
+		"https://trae-api-sg.mchost.guru",
+		"https://trae-api-us.mchost.guru":
+		return true
+	default:
+		return false
+	}
+}
+
+func isLegacyGeneratedCoreHost(raw string) bool {
+	raw = strings.TrimRight(strings.ToLower(strings.TrimSpace(raw)), "/")
+	return raw == "https://trae-api-sg.mchost.guru" || raw == "https://trae-api-us.mchost.guru"
 }
 
 func deviceBrandForType(deviceType, fallback string) string {

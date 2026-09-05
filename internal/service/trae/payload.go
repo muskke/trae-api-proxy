@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-func prepareSoloBody(src []byte, model string) ([]byte, error) {
+func prepareCurrentBody(src []byte, model, function string) ([]byte, error) {
 	var obj map[string]any
 	if err := json.Unmarshal(src, &obj); err != nil {
 		return nil, fmt.Errorf("invalid JSON request: %w", err)
@@ -20,9 +20,14 @@ func prepareSoloBody(src []byte, model string) ([]byte, error) {
 	}
 
 	obj["stream"] = true
-	obj["function"] = soloFunction
-	obj["model"] = model
-	obj["config_name"] = model
+	obj["function"] = function
+	if function == autoChatFunction || strings.EqualFold(strings.TrimSpace(model), "auto") {
+		delete(obj, "config_name")
+		delete(obj, "model")
+	} else {
+		obj["model"] = model
+		obj["config_name"] = model
+	}
 	delete(obj, "stream_options")
 
 	if _, exists := obj["max_tokens"]; !exists {

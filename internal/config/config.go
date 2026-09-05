@@ -17,7 +17,9 @@ import (
 
 const (
 	DefaultOAuthPlatform             = "global"
-	DefaultTraeBaseURL               = "https://trae-api-sg.mchost.guru"
+	DefaultTraeBaseURL               = "https://coresg-normal.trae.ai"
+	DefaultTraeUSBaseURL             = "https://coreva-normal.trae.ai"
+	DefaultTraeCNBaseURL             = "https://trae-api-cn.mchost.guru"
 	DefaultOAuthHost                 = "https://api.trae.ai"
 	DefaultOAuthConsoleURL           = "https://www.trae.ai/authorization"
 	DefaultOAuthClientID             = "ono9krqynydwx5"
@@ -202,7 +204,7 @@ func oauthPlatformDefaults(platform string) oauthDefaults {
 			OAuthHost:    "https://api.trae.com.cn",
 			ConsoleURL:   "https://www.trae.cn/authorization",
 			ClientID:     clientID,
-			APIBaseURL:   "https://trae-api-cn.mchost.guru",
+			APIBaseURL:   DefaultTraeCNBaseURL,
 			Locale:       "zh-cn",
 			GuidanceURLs: DefaultCNLoginGuidanceURLs,
 		}

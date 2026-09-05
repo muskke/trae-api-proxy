@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -367,4 +368,30 @@ func serverURLFromRequest(r *http.Request) string {
 		scheme = "https"
 	}
 	return scheme + "://" + r.Host
+}
+
+func TestGlobalCoreHostRouting(t *testing.T) {
+	if got := apiBaseURLForRegion("sg", "global", "https://trae-api-sg.mchost.guru"); got != config.DefaultTraeBaseURL {
+		t.Fatalf("sg host = %q", got)
+	}
+	if got := apiBaseURLForRegion("us", "global", config.DefaultTraeBaseURL); got != config.DefaultTraeUSBaseURL {
+		t.Fatalf("us host = %q", got)
+	}
+	if got := apiBaseURLForRegion("sg", "global", "https://custom.example"); got != "https://custom.example" {
+		t.Fatalf("custom host = %q", got)
+	}
+}
+
+func TestParseCallbackUsesUserRegionAndHost(t *testing.T) {
+	q := url.Values{}
+	q.Set("authCodeInfo", `{"AuthCode":"abc","ExpireAt":`+strconv.FormatInt(time.Now().Add(time.Minute).UnixMilli(), 10)+`}`)
+	q.Set("userRegion", "sg")
+	q.Set("host", "https://api-sg-central.trae.ai")
+	info, err := parseCallback(q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.LoginRegion != "sg" || info.APIHost != "https://api-sg-central.trae.ai" {
+		t.Fatalf("callback routing = %#v", info)
+	}
 }
