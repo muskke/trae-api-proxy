@@ -47,6 +47,7 @@ func main() {
 	mux.HandleFunc("GET /v1/models/status", h.HandleModelStatus)
 	mux.HandleFunc("DELETE /v1/models/status", h.HandleModelStatusReset)
 	mux.HandleFunc("POST /v1/chat/completions", h.HandleChatCompletions)
+	mux.HandleFunc("POST /v1/responses", h.HandleResponses)
 
 	wrapped := middleware.Chain(
 		mux,

@@ -43,6 +43,7 @@ func (h *APIHandler) HandleRoot(w http.ResponseWriter, _ *http.Request) {
 			"GET /v1/models/status",
 			"DELETE /v1/models/status",
 			"POST /v1/chat/completions",
+			"POST /v1/responses",
 		},
 	})
 }
@@ -68,6 +69,7 @@ func (h *APIHandler) HandleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":                    "ok",
+		"wire_apis":                 []string{"chat_completions", "responses"},
 		"upstream_mode":             h.Config.UpstreamMode,
 		"upstream_host":             host,
 		"upstream_url":              upstreamURL,

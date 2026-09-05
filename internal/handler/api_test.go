@@ -480,3 +480,188 @@ func TestHandlerAppliesReasoningMode(t *testing.T) {
 		t.Fatalf("reasoning header = %q", got)
 	}
 }
+
+func TestResponsesNonStreamingBridge(t *testing.T) {
+	var calls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode upstream body: %v", err)
+		}
+		if body["function"] != "chat_v3" || body["config_name"] != "gpt-5.4" {
+			t.Fatalf("upstream routing = %#v", body)
+		}
+		messages := body["messages"].([]any)
+		if len(messages) != 2 || messages[0].(map[string]any)["role"] != "system" {
+			t.Fatalf("translated messages = %#v", messages)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: output\ndata: {\"response\":\"hello from responses\"}\n\nevent: token_usage\ndata: {\"prompt_tokens\":2,\"completion_tokens\":3,\"total_tokens\":5}\n\nevent: done\ndata: {}\n\n")
+	}))
+	defer upstream.Close()
+
+	h := newTestHandler(upstream.URL)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+		"model":"gpt-5.4",
+		"instructions":"Be concise",
+		"input":"hello",
+		"stream":false,
+		"store":false
+	}`))
+	req.Header.Set("Authorization", "Bearer client-secret")
+	rec := httptest.NewRecorder()
+	h.HandleResponses(rec, req)
+
+	if rec.Code != http.StatusOK || calls.Load() != 1 {
+		t.Fatalf("status=%d calls=%d body=%s", rec.Code, calls.Load(), rec.Body.String())
+	}
+	if rec.Header().Get("X-Trae-Wire-API") != "responses" {
+		t.Fatalf("wire header = %q", rec.Header().Get("X-Trae-Wire-API"))
+	}
+	if !strings.Contains(rec.Body.String(), `"object":"response"`) || !strings.Contains(rec.Body.String(), `"type":"output_text"`) || !strings.Contains(rec.Body.String(), `"text":"hello from responses"`) {
+		t.Fatalf("response = %s", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"input_tokens":2`) || !strings.Contains(rec.Body.String(), `"output_tokens":3`) {
+		t.Fatalf("usage = %s", rec.Body.String())
+	}
+}
+
+func TestResponsesStreamingFunctionCallForCodex(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode upstream body: %v", err)
+		}
+		tools := body["tools"].([]any)
+		fn := tools[0].(map[string]any)["function"].(map[string]any)
+		if fn["name"] != "shell_command" {
+			t.Fatalf("translated tool = %#v", fn)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, `event: output
+data: {"tool_calls":[{"index":0,"id":"call_shell","function_call":{"name":"shell_command","arguments":"{\"command\":\"pwd\"}"}}]}
+
+event: token_usage
+data: {"prompt_tokens":4,"completion_tokens":2,"total_tokens":6}
+
+event: done
+data: {"finish_reason":"tool_calls"}
+
+`)
+	}))
+	defer upstream.Close()
+
+	h := newTestHandler(upstream.URL)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+		"model":"gpt-5.4",
+		"instructions":"You are a coding agent",
+		"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"show cwd"}]}],
+		"tools":[{"type":"function","name":"shell_command","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}],
+		"tool_choice":"auto",
+		"parallel_tool_calls":false,
+		"stream":true,
+		"store":false
+	}`))
+	req.Header.Set("Authorization", "Bearer client-secret")
+	rec := httptest.NewRecorder()
+	h.HandleResponses(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	body := strings.ReplaceAll(rec.Body.String(), "\n+", "\n")
+	for _, expected := range []string{
+		"event: response.created",
+		"event: response.output_item.added",
+		"event: response.function_call_arguments.delta",
+		"event: response.function_call_arguments.done",
+		`"type":"function_call"`,
+		`"call_id":"call_shell"`,
+		"event: response.completed",
+	} {
+		if !strings.Contains(body, expected) {
+			t.Fatalf("missing %q in stream:\n%s", expected, body)
+		}
+	}
+}
+
+func TestResponsesRejectsHostedToolBeforeUpstream(t *testing.T) {
+	var calls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		http.Error(w, "unexpected", http.StatusInternalServerError)
+	}))
+	defer upstream.Close()
+
+	h := newTestHandler(upstream.URL)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+		"model":"gpt-5.4","input":"search","tools":[{"type":"mcp","server_url":"https://example.test/mcp"}]
+	}`))
+	req.Header.Set("Authorization", "Bearer client-secret")
+	rec := httptest.NewRecorder()
+	h.HandleResponses(rec, req)
+	if rec.Code != http.StatusBadRequest || calls.Load() != 0 || !strings.Contains(rec.Body.String(), "hosted tool runtime") {
+		t.Fatalf("status=%d calls=%d body=%s", rec.Code, calls.Load(), rec.Body.String())
+	}
+}
+
+func TestResponsesCustomToolRoundTrip(t *testing.T) {
+	var calls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		call := calls.Add(1)
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode upstream body: %v", err)
+		}
+		tools := body["tools"].([]any)
+		fn := tools[0].(map[string]any)["function"].(map[string]any)
+		if fn["name"] != "apply_patch" {
+			t.Fatalf("custom tool was not bridged as function: %#v", fn)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		if call == 1 {
+			_, _ = io.WriteString(w, "event: output\ndata: {\"tool_calls\":[{\"index\":0,\"id\":\"call_patch\",\"function_call\":{\"name\":\"apply_patch\",\"arguments\":\"{\\\"input\\\":\\\"*** Begin Patch\\\\n*** End Patch\\\"}\"}}]}\n\nevent: done\ndata: {\"finish_reason\":\"tool_calls\"}\n\n")
+			return
+		}
+		messages := body["messages"].([]any)
+		if len(messages) < 3 {
+			t.Fatalf("follow-up messages = %#v", messages)
+		}
+		assistant := messages[len(messages)-2].(map[string]any)
+		toolMessages := messages[len(messages)-1].(map[string]any)
+		if assistant["role"] != "assistant" || toolMessages["role"] != "tool" || toolMessages["tool_call_id"] != "call_patch" {
+			t.Fatalf("follow-up tool loop = %#v", messages)
+		}
+		_, _ = io.WriteString(w, "event: output\ndata: {\"response\":\"patch applied\"}\n\nevent: done\ndata: {}\n\n")
+	}))
+	defer upstream.Close()
+
+	h := newTestHandler(upstream.URL)
+	first := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+		"model":"gpt-5.4","input":"edit file","stream":true,
+		"tools":[{"type":"custom","name":"apply_patch","description":"Apply patch"}]
+	}`))
+	first.Header.Set("Authorization", "Bearer client-secret")
+	firstRec := httptest.NewRecorder()
+	h.HandleResponses(firstRec, first)
+	if firstRec.Code != http.StatusOK || !strings.Contains(firstRec.Body.String(), `"type":"custom_tool_call"`) || !strings.Contains(firstRec.Body.String(), "*** Begin Patch") {
+		t.Fatalf("first response status=%d body=%s", firstRec.Code, firstRec.Body.String())
+	}
+
+	second := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+		"model":"gpt-5.4","stream":false,
+		"input":[
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"edit file"}]},
+			{"type":"custom_tool_call","call_id":"call_patch","name":"apply_patch","input":"*** Begin Patch\n*** End Patch"},
+			{"type":"custom_tool_call_output","call_id":"call_patch","output":[{"type":"input_text","text":"Done!"}]}
+		],
+		"tools":[{"type":"custom","name":"apply_patch","description":"Apply patch"}]
+	}`))
+	second.Header.Set("Authorization", "Bearer client-secret")
+	secondRec := httptest.NewRecorder()
+	h.HandleResponses(secondRec, second)
+	if secondRec.Code != http.StatusOK || !strings.Contains(secondRec.Body.String(), "patch applied") || calls.Load() != 2 {
+		t.Fatalf("second response status=%d calls=%d body=%s", secondRec.Code, calls.Load(), secondRec.Body.String())
+	}
+}
