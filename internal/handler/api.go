@@ -57,15 +57,23 @@ func (h *APIHandler) HandleStatus(w http.ResponseWriter, r *http.Request) {
 	if !h.authorizeClient(r, w) {
 		return
 	}
-	host := h.Config.APIBaseURL
-	if parsed, err := url.Parse(h.Config.APIBaseURL); err == nil && parsed.Host != "" {
+	authStatus := h.Auth.Status()
+	upstreamURL := authStatus.APIBaseURL
+	if upstreamURL == "" {
+		upstreamURL = h.Config.APIBaseURL
+	}
+	host := upstreamURL
+	if parsed, err := url.Parse(upstreamURL); err == nil && parsed.Host != "" {
 		host = parsed.Host
 	}
-	authStatus := h.Auth.Status()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":                    "ok",
 		"upstream_mode":             h.Config.UpstreamMode,
 		"upstream_host":             host,
+		"upstream_url":              upstreamURL,
+		"upstream_function":         h.Client.FunctionFor(trae.Session{Platform: authStatus.Platform}, h.Config.DefaultModel),
+		"reasoning_mode":            h.Config.ReasoningMode,
+		"model_status_persistent":   strings.TrimSpace(h.Config.ModelStatusFile) != "",
 		"upstream_token_configured": authStatus.Authenticated,
 		"upstream_auth_source":      authStatus.Source,
 		"client_auth_enabled":       h.Config.AuthToken != "",
@@ -239,6 +247,7 @@ func (h *APIHandler) HandleChatCompletions(w http.ResponseWriter, r *http.Reques
 	w.Header().Set("X-Proxied-Model", model)
 	w.Header().Set("X-Trae-Function", h.Client.FunctionFor(session, model))
 	w.Header().Set("X-Trae-Model-Status", string(status.Status))
+	w.Header().Set("X-Trae-Reasoning-Mode", h.Config.ReasoningMode)
 	if status.Status == trae.ModelUnavailable {
 		writeOpenAIError(w, http.StatusBadRequest, "model_unavailable", fmt.Sprintf("model %q is temporarily marked unavailable for this TRAE account; retry after the cache expires or clear it with DELETE /v1/models/status?model=%s", model, url.QueryEscape(model)))
 		return
@@ -272,7 +281,7 @@ func (h *APIHandler) HandleChatCompletions(w http.ResponseWriter, r *http.Reques
 		// StreamToOpenAI sets SSE headers before the first write. Errors that happen
 		// after streaming starts are encoded inside the SSE body because status 200
 		// has already been committed by then.
-		if err := trae.StreamToOpenAI(w, resp.Body, model, request.StreamOptions.IncludeUsage); err != nil {
+		if err := trae.StreamToOpenAIWithOptions(w, resp.Body, model, request.StreamOptions.IncludeUsage, trae.TransformOptions{ReasoningMode: h.Config.ReasoningMode}); err != nil {
 			h.recordModelError(session, model, err, capabilitySafe)
 			log.Printf("stream conversion error: %v", err)
 			return
@@ -281,7 +290,7 @@ func (h *APIHandler) HandleChatCompletions(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	result, err := trae.AggregateToOpenAI(resp.Body, model)
+	result, err := trae.AggregateToOpenAIWithOptions(resp.Body, model, trae.TransformOptions{ReasoningMode: h.Config.ReasoningMode})
 	if err != nil {
 		if h.recordModelError(session, model, err, capabilitySafe) {
 			writeOpenAIError(w, http.StatusBadRequest, "model_unavailable", fmt.Sprintf("model %q was rejected by TRAE for a minimal chat request", model))

@@ -76,6 +76,7 @@ type Client struct {
 
 	capabilityMu      sync.RWMutex
 	modelCapabilities map[string]modelCapability
+	capabilityPersist sync.Mutex
 }
 
 func NewClient(cfg *config.Config) *Client {
@@ -93,7 +94,7 @@ func NewClient(cfg *config.Config) *Client {
 	transport.ExpectContinueTimeout = time.Second
 	transport.ResponseHeaderTimeout = cfg.HeaderTimeout
 
-	return &Client{
+	client := &Client{
 		Config:            cfg,
 		modelCache:        make(map[string]modelCacheEntry),
 		modelCapabilities: make(map[string]modelCapability),
@@ -103,6 +104,8 @@ func NewClient(cfg *config.Config) *Client {
 		},
 		StreamClient: &http.Client{Transport: transport},
 	}
+	client.loadModelCapabilities()
+	return client
 }
 
 func (c *Client) CloseIdleConnections() {

@@ -74,6 +74,8 @@ type Status struct {
 	Source           string `json:"source"`
 	Platform         string `json:"platform,omitempty"`
 	LoginRegion      string `json:"login_region,omitempty"`
+	APIBaseURL       string `json:"api_base_url,omitempty"`
+	OAuthHost        string `json:"oauth_host,omitempty"`
 	Authenticated    bool   `json:"authenticated"`
 	Refreshable      bool   `json:"refreshable"`
 	AutoRefresh      bool   `json:"auto_refresh"`
@@ -404,7 +406,14 @@ func (m *Manager) Status() Status {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	st := Status{Mode: m.cfg.AuthMode, Source: "none", LastError: m.lastError}
+	st := Status{
+		Mode:       m.cfg.AuthMode,
+		Source:     "none",
+		Platform:   m.cfg.OAuthPlatform,
+		APIBaseURL: m.cfg.APIBaseURL,
+		OAuthHost:  m.cfg.OAuthHost,
+		LastError:  m.lastError,
+	}
 	if !m.lastRefreshAt.IsZero() {
 		st.LastRefreshAt = m.lastRefreshAt.Unix()
 	}
@@ -412,6 +421,8 @@ func (m *Manager) Status() Status {
 		st.Source = "oauth"
 		st.Platform = firstNonEmpty(m.credential.Auth.Platform, m.cfg.OAuthPlatform)
 		st.LoginRegion = m.credential.Auth.LoginRegion
+		st.APIBaseURL = firstNonEmpty(m.credential.Auth.APIBaseURL, m.cfg.APIBaseURL)
+		st.OAuthHost = firstNonEmpty(m.credential.Auth.APIHost, m.cfg.OAuthHost)
 		st.Authenticated = m.credential.Auth.AccessToken != "" && (m.credential.Auth.ExpiresAt <= 0 || m.now().Unix() < m.credential.Auth.ExpiresAt)
 		st.Refreshable = m.credential.Auth.RefreshToken != "" && (m.credential.Auth.RefreshExpiresAt <= 0 || m.now().Unix() < m.credential.Auth.RefreshExpiresAt)
 		st.AutoRefresh = st.Refreshable

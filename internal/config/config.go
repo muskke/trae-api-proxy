@@ -30,6 +30,8 @@ const (
 	DefaultOAuthPluginVer            = "local"
 	DefaultOAuthCallbackPort         = "18080"
 	DefaultAuthFile                  = "./data/trae-auth.json"
+	DefaultModelStatusFile           = "./data/model-status.json"
+	DefaultReasoningMode             = "preserve"
 	DefaultAppID                     = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8"
 	DefaultIDEVersion                = "3.5.66"
 	DefaultIDEVersionCode            = "20260811"
@@ -98,6 +100,8 @@ type Config struct {
 	ModelCacheTTL      time.Duration
 	ModelFailureTTL    time.Duration
 	ModelSuccessTTL    time.Duration
+	ModelStatusFile    string
+	ReasoningMode      string
 	MaxBodyBytes       int64
 	CORSAllowOrigin    string
 
@@ -169,6 +173,8 @@ func Load() *Config {
 		ModelCacheTTL:      envDuration("TRAE_MODEL_CACHE_TTL", defaultModelCacheTTL),
 		ModelFailureTTL:    envDuration("TRAE_MODEL_FAILURE_TTL", defaultModelFailureTTL),
 		ModelSuccessTTL:    envDuration("TRAE_MODEL_SUCCESS_TTL", defaultModelSuccessTTL),
+		ModelStatusFile:    utils.EnvOrDefault("TRAE_MODEL_STATUS_FILE", DefaultModelStatusFile),
+		ReasoningMode:      strings.ToLower(utils.EnvOrDefault("TRAE_REASONING_MODE", DefaultReasoningMode)),
 		MaxBodyBytes:       envInt64("MAX_BODY_BYTES", defaultMaxBodyBytes),
 		CORSAllowOrigin:    os.Getenv("CORS_ALLOW_ORIGIN"),
 
@@ -304,6 +310,11 @@ func (c *Config) Validate() error {
 	default:
 		return fmt.Errorf("TRAE_OAUTH_PLATFORM must be global, global-solo, cn, or cn-solo")
 	}
+	switch c.ReasoningMode {
+	case "preserve", "merge", "drop":
+	default:
+		return fmt.Errorf("TRAE_REASONING_MODE must be preserve, merge, or drop")
+	}
 
 	if err := validateAbsoluteHTTPURL("TRAE_API_BASE_URL", c.APIBaseURL); err != nil {
 		return err
@@ -344,6 +355,9 @@ func (c *Config) Validate() error {
 	}
 	if c.MaxBodyBytes <= 0 {
 		return fmt.Errorf("MAX_BODY_BYTES must be greater than zero")
+	}
+	if strings.TrimSpace(c.ModelStatusFile) == "" {
+		return fmt.Errorf("TRAE_MODEL_STATUS_FILE must not be empty")
 	}
 	if c.RequestTimeout <= 0 || c.HeaderTimeout <= 0 || c.ShutdownTimeout <= 0 || c.ModelCacheTTL <= 0 || c.ModelFailureTTL <= 0 || c.ModelSuccessTTL <= 0 || c.OAuthRefreshSkew <= 0 || c.OAuthRefreshEvery <= 0 || c.OAuthLoginTTL <= 0 {
 		return fmt.Errorf("timeout values, refresh intervals, and model cache TTLs must be greater than zero")

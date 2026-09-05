@@ -96,3 +96,82 @@ func TestForEachSSEEventToleratesMissingBlankLines(t *testing.T) {
 		t.Fatalf("events = %v", names)
 	}
 }
+
+func TestAuxiliarySSEEventsDoNotBreakCompletion(t *testing.T) {
+	input := `event: progress_notice
+data: "Preparing model"
+
+` + `event: heartbeat
+data: null
+
+` + `event: future_aux_event
+data: this-is-not-json
+
+` + `event: output
+data: {"response":"Hello"}
+
+` + `event: done
+data: {"finish_reason":"stop"}
+
+`
+
+	recorder := httptest.NewRecorder()
+	if err := StreamToOpenAI(recorder, strings.NewReader(input), "gpt-5.4", false); err != nil {
+		t.Fatalf("auxiliary events should be ignored, got %v", err)
+	}
+	body := recorder.Body.String()
+	if !strings.Contains(body, `"content":"Hello"`) || !strings.HasSuffix(body, "data: [DONE]\n\n") {
+		t.Fatalf("unexpected stream: %s", body)
+	}
+}
+
+func TestReasoningModes(t *testing.T) {
+	input := `event: output
+data: {"response":"answer","reasoning_content":"thought:"}
+
+` + `event: done
+data: {"finish_reason":"stop"}
+
+`
+
+	preserved, err := AggregateToOpenAIWithOptions(strings.NewReader(input), "m", TransformOptions{ReasoningMode: "preserve"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	preservedMessage := preserved["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
+	if preservedMessage["content"] != "answer" || preservedMessage["reasoning_content"] != "thought:" {
+		t.Fatalf("preserve message = %#v", preservedMessage)
+	}
+
+	merged, err := AggregateToOpenAIWithOptions(strings.NewReader(input), "m", TransformOptions{ReasoningMode: "merge"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mergedMessage := merged["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
+	if mergedMessage["content"] != "thought:answer" {
+		t.Fatalf("merge message = %#v", mergedMessage)
+	}
+	if _, ok := mergedMessage["reasoning_content"]; ok {
+		t.Fatalf("merge should not expose reasoning_content: %#v", mergedMessage)
+	}
+
+	dropped, err := AggregateToOpenAIWithOptions(strings.NewReader(input), "m", TransformOptions{ReasoningMode: "drop"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	droppedMessage := dropped["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
+	if droppedMessage["content"] != "answer" {
+		t.Fatalf("drop message = %#v", droppedMessage)
+	}
+	if _, ok := droppedMessage["reasoning_content"]; ok {
+		t.Fatalf("drop should not expose reasoning_content: %#v", droppedMessage)
+	}
+
+	recorder := httptest.NewRecorder()
+	if err := StreamToOpenAIWithOptions(recorder, strings.NewReader(input), "m", false, TransformOptions{ReasoningMode: "merge"}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(recorder.Body.String(), `"content":"thought:answer"`) || strings.Contains(recorder.Body.String(), "reasoning_content") {
+		t.Fatalf("merge stream = %s", recorder.Body.String())
+	}
+}

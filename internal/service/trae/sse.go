@@ -29,6 +29,10 @@ type StreamError struct {
 	Message string
 }
 
+type TransformOptions struct {
+	ReasoningMode string
+}
+
 func (e *StreamError) Error() string {
 	if e.Code == "" {
 		return "upstream stream error: " + e.Message
@@ -37,10 +41,15 @@ func (e *StreamError) Error() string {
 }
 
 func AggregateToOpenAI(r io.Reader, model string) (map[string]any, error) {
+	return AggregateToOpenAIWithOptions(r, model, TransformOptions{ReasoningMode: "preserve"})
+}
+
+func AggregateToOpenAIWithOptions(r io.Reader, model string, options TransformOptions) (map[string]any, error) {
 	id := ""
 	created := time.Now().Unix()
 	var content strings.Builder
 	var reasoning strings.Builder
+	var merged strings.Builder
 	finishReason := ""
 	var usage map[string]any
 	toolCalls := map[int]map[string]any{}
@@ -56,8 +65,16 @@ func AggregateToOpenAI(r io.Reader, model string) (map[string]any, error) {
 		}
 		switch event.Name {
 		case "output":
-			content.WriteString(event.Content)
-			reasoning.WriteString(event.Reasoning)
+			switch normalizeReasoningMode(options.ReasoningMode) {
+			case "merge":
+				merged.WriteString(event.Reasoning)
+				merged.WriteString(event.Content)
+			case "drop":
+				content.WriteString(event.Content)
+			default:
+				content.WriteString(event.Content)
+				reasoning.WriteString(event.Reasoning)
+			}
 			mergeToolCalls(toolCalls, &toolOrder, event.ToolCalls)
 		case "token_usage":
 			usage = event.Usage
@@ -85,13 +102,18 @@ func AggregateToOpenAI(r io.Reader, model string) (map[string]any, error) {
 		}
 	}
 
+	reasoningMode := normalizeReasoningMode(options.ReasoningMode)
+	if reasoningMode == "merge" {
+		content.Reset()
+		content.WriteString(merged.String())
+	}
 	message := map[string]any{"role": "assistant"}
 	if content.Len() > 0 || len(toolOrder) == 0 {
 		message["content"] = content.String()
 	} else {
 		message["content"] = nil
 	}
-	if reasoning.Len() > 0 {
+	if reasoningMode == "preserve" && reasoning.Len() > 0 {
 		message["reasoning_content"] = reasoning.String()
 	}
 	if len(toolOrder) > 0 {
@@ -125,6 +147,10 @@ func AggregateToOpenAI(r io.Reader, model string) (map[string]any, error) {
 }
 
 func StreamToOpenAI(w http.ResponseWriter, r io.Reader, model string, includeUsage bool) error {
+	return StreamToOpenAIWithOptions(w, r, model, includeUsage, TransformOptions{ReasoningMode: "preserve"})
+}
+
+func StreamToOpenAIWithOptions(w http.ResponseWriter, r io.Reader, model string, includeUsage bool, options TransformOptions) error {
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream; charset=utf-8")
 	h.Set("Cache-Control", "no-cache, no-transform")
@@ -199,11 +225,22 @@ func StreamToOpenAI(w http.ResponseWriter, r io.Reader, model string, includeUsa
 				delta["role"] = "assistant"
 				roleSent = true
 			}
-			if event.Content != "" {
-				delta["content"] = event.Content
-			}
-			if event.Reasoning != "" {
-				delta["reasoning_content"] = event.Reasoning
+			switch normalizeReasoningMode(options.ReasoningMode) {
+			case "merge":
+				if event.Reasoning != "" || event.Content != "" {
+					delta["content"] = event.Reasoning + event.Content
+				}
+			case "drop":
+				if event.Content != "" {
+					delta["content"] = event.Content
+				}
+			default:
+				if event.Content != "" {
+					delta["content"] = event.Content
+				}
+				if event.Reasoning != "" {
+					delta["reasoning_content"] = event.Reasoning
+				}
 			}
 			if calls := normalizeToolCallDelta(event.ToolCalls); len(calls) > 0 {
 				hasToolCalls = true
@@ -297,6 +334,13 @@ func parseEvent(name, data string) (*normalizedEvent, error) {
 		return event, nil
 	}
 
+	// Auxiliary and future upstream events are intentionally ignored. TRAE has
+	// emitted progress_notice as a JSON string in the wild, and unknown events
+	// must never terminate an otherwise healthy completion stream.
+	if !requiresObjectPayload(event.Name) {
+		return event, nil
+	}
+
 	var raw map[string]any
 	if err := json.Unmarshal([]byte(data), &raw); err != nil {
 		return nil, fmt.Errorf("decode upstream SSE %q: %w", event.Name, err)
@@ -330,6 +374,24 @@ func parseEvent(name, data string) (*normalizedEvent, error) {
 		}
 	}
 	return event, nil
+}
+
+func requiresObjectPayload(name string) bool {
+	switch strings.TrimSpace(name) {
+	case "metadata", "output", "token_usage", "done", "error":
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeReasoningMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "merge", "drop":
+		return strings.ToLower(strings.TrimSpace(mode))
+	default:
+		return "preserve"
+	}
 }
 
 func normalizeCompletionID(value any) string {

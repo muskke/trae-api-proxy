@@ -112,3 +112,34 @@ func TestExpiredAvailabilityReturnsToUnknown(t *testing.T) {
 		t.Fatalf("expired status = %q", got)
 	}
 }
+
+func TestModelAvailabilityPersistsAcrossClientRestart(t *testing.T) {
+	path := t.TempDir() + "/model-status.json"
+	cfg := &config.Config{
+		ModelFailureTTL: time.Hour,
+		ModelSuccessTTL: time.Hour,
+		ModelStatusFile: path,
+	}
+	session := Session{UID: "persisted-user", Platform: "global", APIBaseURL: "https://example.test"}
+
+	first := NewClient(cfg)
+	first.RecordModelSuccess(session, "minimax-m3")
+	first.RecordModelFailure(session, "deepseek-v4-flash", "4001", "param invalid", true)
+
+	second := NewClient(cfg)
+	if got := second.ModelAvailability(session, "minimax-m3").Status; got != ModelUsable {
+		t.Fatalf("persisted usable status = %q", got)
+	}
+	failure := second.ModelAvailability(session, "deepseek-v4-flash")
+	if failure.Status != ModelUnavailable || failure.LastErrorCode != "4001" {
+		t.Fatalf("persisted unavailable status = %+v", failure)
+	}
+
+	if removed := second.ResetModelAvailability(session, "deepseek-v4-flash"); removed != 1 {
+		t.Fatalf("removed = %d", removed)
+	}
+	third := NewClient(cfg)
+	if got := third.ModelAvailability(session, "deepseek-v4-flash").Status; got != ModelUnknown {
+		t.Fatalf("reset should persist, status = %q", got)
+	}
+}

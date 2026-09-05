@@ -98,10 +98,28 @@ func validConfig() *Config {
 		ModelCacheTTL:     time.Minute,
 		ModelFailureTTL:   time.Minute,
 		ModelSuccessTTL:   time.Hour,
+		ModelStatusFile:   DefaultModelStatusFile,
+		ReasoningMode:     DefaultReasoningMode,
 		OAuthRefreshSkew:  time.Hour,
 		OAuthRefreshEvery: time.Minute,
 		OAuthLoginTTL:     time.Minute,
 		MaxBodyBytes:      1024,
+	}
+}
+
+func TestValidateReasoningMode(t *testing.T) {
+	for _, mode := range []string{"preserve", "merge", "drop"} {
+		cfg := validConfig()
+		cfg.ReasoningMode = mode
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("mode %s: %v", mode, err)
+		}
+	}
+
+	cfg := validConfig()
+	cfg.ReasoningMode = "surprise"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected invalid TRAE_REASONING_MODE to fail validation")
 	}
 }
 

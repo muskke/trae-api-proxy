@@ -456,3 +456,27 @@ func TestProxyPreservesUTF8MessageContent(t *testing.T) {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
 }
+
+func TestHandlerAppliesReasoningMode(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: progress_notice\ndata: \"warming up\"\n\nevent: output\ndata: {\"reasoning_content\":\"thought:\",\"response\":\"answer\"}\n\nevent: done\ndata: {}\n\n")
+	}))
+	defer upstream.Close()
+
+	h := newTestHandler(upstream.URL)
+	h.Config.ReasoningMode = "merge"
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"minimax-m3","messages":[{"role":"user","content":"hi"}],"stream":false}`))
+	req.Header.Set("Authorization", "Bearer client-secret")
+	rec := httptest.NewRecorder()
+	h.HandleChatCompletions(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"content":"thought:answer"`) || strings.Contains(rec.Body.String(), "reasoning_content") {
+		t.Fatalf("response = %s", rec.Body.String())
+	}
+	if got := rec.Header().Get("X-Trae-Reasoning-Mode"); got != "merge" {
+		t.Fatalf("reasoning header = %q", got)
+	}
+}
