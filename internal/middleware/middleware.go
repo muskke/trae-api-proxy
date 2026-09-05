@@ -1,6 +1,8 @@
 package middleware
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"net/http"
@@ -8,22 +10,39 @@ import (
 	"time"
 )
 
-// ResponseWriter wrapper to capture status code
 type responseWriter struct {
 	http.ResponseWriter
-	statusCode int
+	statusCode  int
+	bytes       int64
+	wroteHeader bool
 }
 
 func (rw *responseWriter) WriteHeader(code int) {
+	if rw.wroteHeader {
+		return
+	}
+	rw.wroteHeader = true
 	rw.statusCode = code
 	rw.ResponseWriter.WriteHeader(code)
 }
 
-func (rw *responseWriter) Flush() {
-	if flusher, ok := rw.ResponseWriter.(http.Flusher); ok {
-		flusher.Flush()
+func (rw *responseWriter) Write(p []byte) (int, error) {
+	if !rw.wroteHeader {
+		rw.WriteHeader(http.StatusOK)
 	}
+	n, err := rw.ResponseWriter.Write(p)
+	rw.bytes += int64(n)
+	return n, err
 }
+
+func (rw *responseWriter) Flush() {
+	if !rw.wroteHeader {
+		rw.WriteHeader(http.StatusOK)
+	}
+	_ = http.NewResponseController(rw.ResponseWriter).Flush()
+}
+
+func (rw *responseWriter) Unwrap() http.ResponseWriter { return rw.ResponseWriter }
 
 func Logger(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -35,18 +54,62 @@ func Logger(next http.Handler) http.Handler {
 		model := rw.Header().Get("X-Proxied-Model")
 		modelLog := ""
 		if model != "" {
-			modelLog = fmt.Sprintf(" [%s]", model)
+			modelLog = fmt.Sprintf(" model=%q", model)
 		}
-
 		log.Printf(
-			"%s %s %d%s %s",
+			"request_id=%s method=%s path=%s status=%d bytes=%d%s duration=%s",
+			rw.Header().Get("X-Request-ID"),
 			r.Method,
 			r.URL.Path,
 			rw.statusCode,
+			rw.bytes,
 			modelLog,
-			time.Since(start),
+			time.Since(start).Round(time.Millisecond),
 		)
 	})
+}
+
+func RequestID(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestID := r.Header.Get("X-Request-ID")
+		if requestID == "" {
+			var raw [8]byte
+			if _, err := rand.Read(raw[:]); err == nil {
+				requestID = "req-" + hex.EncodeToString(raw[:])
+			} else {
+				requestID = fmt.Sprintf("req-%d", time.Now().UnixNano())
+			}
+		}
+		w.Header().Set("X-Request-ID", requestID)
+		next.ServeHTTP(w, r)
+	})
+}
+
+func SecurityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		next.ServeHTTP(w, r)
+	})
+}
+
+func CORS(allowOrigin string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if allowOrigin == "" {
+				next.ServeHTTP(w, r)
+				return
+			}
+			w.Header().Set("Access-Control-Allow-Origin", allowOrigin)
+			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-API-Key, X-Request-ID")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			if r.Method == http.MethodOptions {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
 func Recovery(next http.Handler) http.Handler {

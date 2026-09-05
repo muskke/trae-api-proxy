@@ -2,10 +2,9 @@ package main
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"log"
 	"net/http"
-	"os"
 	"os/signal"
 	"syscall"
 	"time"
@@ -17,59 +16,55 @@ import (
 )
 
 func main() {
-	// 1. Load Configuration
 	cfg := config.Load()
+	if err := cfg.Validate(); err != nil {
+		log.Fatalf("configuration error: %v", err)
+	}
 
-	// 2. Initialize Services
 	traeClient := trae.NewClient(cfg)
-
-	// 3. Initialize Handlers
+	defer traeClient.CloseIdleConnections()
 	h := handler.NewAPIHandler(cfg, traeClient)
 
-	// 4. Setup Routes
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/models", h.HandleModels)
-	mux.HandleFunc("/v1/chat/completions", h.HandleChatCompletions)
+	mux.HandleFunc("GET /{$}", h.HandleRoot)
+	mux.HandleFunc("GET /healthz", h.HandleHealth)
+	mux.HandleFunc("GET /status", h.HandleStatus)
+	mux.HandleFunc("GET /v1/models", h.HandleModels)
+	mux.HandleFunc("POST /v1/chat/completions", h.HandleChatCompletions)
 
-	// 5. Middleware
-	handlerWithMiddleware := middleware.Chain(
+	wrapped := middleware.Chain(
 		mux,
+		middleware.RequestID,
+		middleware.SecurityHeaders,
+		middleware.CORS(cfg.CORSAllowOrigin),
 		middleware.Recovery,
 		middleware.Logger,
 	)
 
-	// 6. Setup Server
-	addr := fmt.Sprintf(":%s", cfg.Port)
 	srv := &http.Server{
-		Addr:    addr,
-		Handler: handlerWithMiddleware,
+		Addr:              cfg.ListenAddr(),
+		Handler:           wrapped,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
 
-	// 7. Start Server in Goroutine
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
 	go func() {
-		log.Printf("Trae2OpenAI proxy listening on %s (Locale: %s)", addr, cfg.Locale)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("listen: %s\n", err)
+		log.Printf("trae-api-proxy listening on %s upstream_mode=%s upstream=%s", srv.Addr, cfg.UpstreamMode, cfg.APIBaseURL)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("listen: %v", err)
 		}
 	}()
 
-	// 8. Graceful Shutdown
-	quit := make(chan os.Signal, 1)
-	// kill (no param) default send syscall.SIGTERM
-	// kill -2 is syscall.SIGINT
-	// kill -9 is syscall.SIGKILL but can't be caught, so don't need to add it
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
-	log.Println("Shutting down server...")
-
-	// The context is used to inform the server it has 5 seconds to finish
-	// the request it is currently handling
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	<-ctx.Done()
+	log.Println("shutting down server")
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
-
-	if err := srv.Shutdown(ctx); err != nil {
-		log.Fatal("Server forced to shutdown: ", err)
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("graceful shutdown failed: %v", err)
+		_ = srv.Close()
 	}
-
-	log.Println("Server exiting")
 }

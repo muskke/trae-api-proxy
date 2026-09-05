@@ -5,68 +5,190 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/muskke/trae-api-proxy/internal/config"
-
-	"github.com/google/uuid"
-	"github.com/openai/openai-go"
 )
 
+const (
+	soloChatPath   = "/api/agent/v3/llm_utils_chat"
+	soloModelsPath = "/api/ide/v1/get_detail_param"
+	legacyChatPath = "/api/ide/v1/chat"
+	legacyModels   = "/api/ide/v1/model_list?type=llm_raw_chat"
+	soloFunction   = "solo_work_lite"
+)
+
+type Model struct {
+	ID            string `json:"id"`
+	Object        string `json:"object"`
+	Created       int64  `json:"created"`
+	OwnedBy       string `json:"owned_by"`
+	DisplayName   string `json:"display_name,omitempty"`
+	ContextLength int64  `json:"context_length,omitempty"`
+}
+
+type UpstreamError struct {
+	Mode   string
+	Status int
+	Body   string
+}
+
+func (e *UpstreamError) Error() string {
+	body := strings.TrimSpace(e.Body)
+	if len(body) > 512 {
+		body = body[:512] + "..."
+	}
+	if body == "" {
+		body = http.StatusText(e.Status)
+	}
+	return fmt.Sprintf("upstream %s returned HTTP %d: %s", e.Mode, e.Status, body)
+}
+
 type Client struct {
-	Config     *config.Config
-	HTTPClient *http.Client
+	Config       *config.Config
+	HTTPClient   *http.Client
+	StreamClient *http.Client
+
+	modelMu       sync.RWMutex
+	modelCache    []Model
+	modelCachedAt time.Time
 }
 
 func NewClient(cfg *config.Config) *Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = http.ProxyFromEnvironment
+	transport.DialContext = (&net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}).DialContext
+	transport.ForceAttemptHTTP2 = true
+	transport.MaxIdleConns = 100
+	transport.MaxIdleConnsPerHost = 20
+	transport.IdleConnTimeout = 90 * time.Second
+	transport.TLSHandshakeTimeout = 10 * time.Second
+	transport.ExpectContinueTimeout = time.Second
+	transport.ResponseHeaderTimeout = cfg.HeaderTimeout
+
 	return &Client{
 		Config: cfg,
 		HTTPClient: &http.Client{
-			Timeout: 0, // No timeout for streaming, handle via context
-			Transport: &http.Transport{
-				Proxy: http.ProxyFromEnvironment,
-				DialContext: (&net.Dialer{
-					Timeout:   30 * time.Second,
-					KeepAlive: 30 * time.Second,
-				}).DialContext,
-				ForceAttemptHTTP2:     true,
-				MaxIdleConns:          100,
-				MaxIdleConnsPerHost:   100,
-				IdleConnTimeout:       90 * time.Second,
-				TLSHandshakeTimeout:   10 * time.Second,
-				ExpectContinueTimeout: 1 * time.Second,
-			},
+			Timeout:   cfg.RequestTimeout,
+			Transport: transport,
 		},
+		StreamClient: &http.Client{Transport: transport},
 	}
 }
 
-func (c *Client) headers(ideToken string) http.Header {
-	h := http.Header{}
+func (c *Client) CloseIdleConnections() {
+	c.HTTPClient.CloseIdleConnections()
+	c.StreamClient.CloseIdleConnections()
+}
+
+func (c *Client) headers(ideToken, accept string) http.Header {
+	h := make(http.Header)
 	h.Set("Content-Type", "application/json")
-	h.Set("x-app-id", c.Config.AppID)
-	h.Set("x-device-brand", c.Config.DeviceBrand)
-	h.Set("x-device-cpu", c.Config.DeviceCPU)
-	h.Set("x-device-id", c.Config.DeviceID)
-	h.Set("x-device-type", c.Config.DeviceType)
-	h.Set("x-ide-token", ideToken)
-	h.Set("x-ide-version", c.Config.IDEVersion)
-	h.Set("x-ide-version-code", c.Config.IDEVersionCode)
-	h.Set("x-ide-version-type", c.Config.IDEVersionType)
-	h.Set("x-machine-id", c.Config.MachineID)
-	h.Set("x-os-version", c.Config.OSVersion)
+	if accept != "" {
+		h.Set("Accept", accept)
+	}
+	if c.Config.IDEVersion != "" {
+		h.Set("User-Agent", "Trae/"+c.Config.IDEVersion)
+		h.Set("X-Ide-Version", c.Config.IDEVersion)
+	}
+	if ideToken != "" {
+		h.Set("Authorization", "Cloud-IDE-JWT "+ideToken)
+		h.Set("X-Cloudide-Token", ideToken)
+		h.Set("X-Ide-Token", ideToken)
+	}
+	setIfNotEmpty(h, "X-Uid", c.Config.UID)
+	setIfNotEmpty(h, "X-App-Id", c.Config.AppID)
+	setIfNotEmpty(h, "X-App-Version", c.Config.AppVersion)
+	setIfNotEmpty(h, "X-App-Version-Code", c.Config.IDEVersionCode)
+	setIfNotEmpty(h, "X-Ide-Version-Code", c.Config.IDEVersionCode)
+	setIfNotEmpty(h, "X-Ide-Version-Type", c.Config.IDEVersionType)
+	setIfNotEmpty(h, "X-Device-Brand", c.Config.DeviceBrand)
+	setIfNotEmpty(h, "X-Device-Cpu", c.Config.DeviceCPU)
+	setIfNotEmpty(h, "X-Device-Id", c.Config.DeviceID)
+	setIfNotEmpty(h, "X-Device-Type", c.Config.DeviceType)
+	setIfNotEmpty(h, "X-Machine-Id", c.Config.MachineID)
+	setIfNotEmpty(h, "X-OS-Version", c.Config.OSVersion)
+	setIfNotEmpty(h, "Request-Traffic-Type", c.Config.RequestTrafficType)
 	return h
 }
 
-func (c *Client) ListModels(ctx context.Context, ideToken string) ([]openai.Model, error) {
-	req, _ := http.NewRequestWithContext(
-		ctx,
-		"GET",
-		c.Config.APIBaseURL+"/api/ide/v1/model_list?type=llm_raw_chat",
-		nil,
-	)
-	req.Header = c.headers(ideToken)
+func setIfNotEmpty(h http.Header, key, value string) {
+	if strings.TrimSpace(value) != "" {
+		h.Set(key, value)
+	}
+}
+
+func (c *Client) ListModels(ctx context.Context, ideToken string) ([]Model, error) {
+	c.modelMu.RLock()
+	if len(c.modelCache) > 0 && time.Since(c.modelCachedAt) < c.Config.ModelCacheTTL {
+		cached := append([]Model(nil), c.modelCache...)
+		c.modelMu.RUnlock()
+		return cached, nil
+	}
+	stale := append([]Model(nil), c.modelCache...)
+	c.modelMu.RUnlock()
+
+	models, err := c.fetchModels(ctx, ideToken)
+	if err != nil {
+		if len(stale) > 0 {
+			return stale, nil
+		}
+		return nil, err
+	}
+
+	c.modelMu.Lock()
+	c.modelCache = append([]Model(nil), models...)
+	c.modelCachedAt = time.Now()
+	c.modelMu.Unlock()
+	return models, nil
+}
+
+func (c *Client) fetchModels(ctx context.Context, ideToken string) ([]Model, error) {
+	switch c.Config.UpstreamMode {
+	case "solo":
+		return c.fetchModelsMode(ctx, ideToken, "solo")
+	case "legacy":
+		return c.fetchModelsMode(ctx, ideToken, "legacy")
+	default:
+		models, err := c.fetchModelsMode(ctx, ideToken, "solo")
+		if err == nil || !canProtocolFallback(err) {
+			return models, err
+		}
+		return c.fetchModelsMode(ctx, ideToken, "legacy")
+	}
+}
+
+func (c *Client) fetchModelsMode(ctx context.Context, ideToken, mode string) ([]Model, error) {
+	var req *http.Request
+	var err error
+
+	if mode == "solo" {
+		payload := map[string]any{
+			"function":            soloFunction,
+			"config_names":        nil,
+			"need_prompt":         false,
+			"current_config_info": nil,
+			"poly_prompt":         true,
+			"mode_type":           nil,
+			"agent_type":          nil,
+		}
+		body, _ := json.Marshal(payload)
+		req, err = http.NewRequestWithContext(ctx, http.MethodPost, c.Config.APIBaseURL+soloModelsPath, bytes.NewReader(body))
+	} else {
+		req, err = http.NewRequestWithContext(ctx, http.MethodGet, c.Config.APIBaseURL+legacyModels, nil)
+	}
+	if err != nil {
+		return nil, err
+	}
+	req.Header = c.headers(ideToken, "application/json")
 
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
@@ -74,8 +196,41 @@ func (c *Client) ListModels(ctx context.Context, ideToken string) ([]openai.Mode
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("upstream status: %s", resp.Status)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		return nil, &UpstreamError{Mode: mode, Status: resp.StatusCode, Body: string(body)}
+	}
+
+	if mode == "solo" {
+		var raw struct {
+			ConfigInfoList []struct {
+				ConfigName     string `json:"config_name"`
+				MaxInputTokens int64  `json:"max_input_tokens"`
+				DisplayConfig  struct {
+					DisplayName string `json:"display_name"`
+				} `json:"display_config"`
+			} `json:"config_info_list"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+			return nil, fmt.Errorf("decode solo model list: %w", err)
+		}
+		models := make([]Model, 0, len(raw.ConfigInfoList))
+		for _, item := range raw.ConfigInfoList {
+			if strings.TrimSpace(item.ConfigName) == "" {
+				continue
+			}
+			models = append(models, Model{
+				ID:            item.ConfigName,
+				Object:        "model",
+				OwnedBy:       "trae-solo",
+				DisplayName:   item.DisplayConfig.DisplayName,
+				ContextLength: item.MaxInputTokens,
+			})
+		}
+		if len(models) == 0 {
+			return nil, fmt.Errorf("solo model list was empty")
+		}
+		return models, nil
 	}
 
 	var raw struct {
@@ -83,78 +238,79 @@ func (c *Client) ListModels(ctx context.Context, ideToken string) ([]openai.Mode
 			Name string `json:"name"`
 		} `json:"model_configs"`
 	}
-
 	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("decode legacy model list: %w", err)
 	}
-
-	models := make([]openai.Model, 0)
-	for _, m := range raw.ModelConfigs {
-		models = append(models, openai.Model{
-			ID:      m.Name,
-			Object:  "model",
-			Created: 0,
-			OwnedBy: "trae",
-		})
+	models := make([]Model, 0, len(raw.ModelConfigs))
+	for _, item := range raw.ModelConfigs {
+		if strings.TrimSpace(item.Name) == "" {
+			continue
+		}
+		models = append(models, Model{ID: item.Name, Object: "model", OwnedBy: "trae"})
+	}
+	if len(models) == 0 {
+		return nil, fmt.Errorf("legacy model list was empty")
 	}
 	return models, nil
 }
 
-func (c *Client) ChatCompletion(ctx context.Context, ideToken string, model string, messages []openai.ChatCompletionMessage, stream bool) (*http.Response, error) {
-	currentTurn := 0
-	for i := 0; i < len(messages)-1; i++ {
-		if messages[i].Role == "user" {
-			currentTurn++
+// ChatCompletion sends an OpenAI-compatible request to the selected upstream
+// protocol. The upstream is always asked for SSE; non-streaming client requests
+// are aggregated by the handler so both modes share the same parser.
+func (c *Client) ChatCompletion(ctx context.Context, ideToken, model string, rawBody []byte) (*http.Response, string, error) {
+	switch c.Config.UpstreamMode {
+	case "solo":
+		resp, err := c.chatMode(ctx, ideToken, model, rawBody, "solo")
+		return resp, "solo", err
+	case "legacy":
+		resp, err := c.chatMode(ctx, ideToken, model, rawBody, "legacy")
+		return resp, "legacy", err
+	default:
+		resp, err := c.chatMode(ctx, ideToken, model, rawBody, "solo")
+		if err == nil || !canProtocolFallback(err) {
+			return resp, "solo", err
 		}
+		resp, err = c.chatMode(ctx, ideToken, model, rawBody, "legacy")
+		return resp, "legacy", err
 	}
+}
 
-	if len(messages) == 0 {
-		return nil, fmt.Errorf("no messages")
+func (c *Client) chatMode(ctx context.Context, ideToken, model string, rawBody []byte, mode string) (*http.Response, error) {
+	var body []byte
+	var err error
+	path := soloChatPath
+	if mode == "solo" {
+		body, err = prepareSoloBody(rawBody, model)
+	} else {
+		path = legacyChatPath
+		body, err = prepareLegacyBody(rawBody, model, c.Config.Locale)
 	}
-	lastMsg := messages[len(messages)-1]
-
-	history := []any{}
-	for _, m := range messages[:len(messages)-1] {
-		history = append(history, map[string]any{
-			"role":    m.Role,
-			"content": m.Content,
-			"status":  "success",
-			"locale":  c.Config.Locale,
-		})
-	}
-
-	payload := map[string]any{
-		"chat_history":                 history,
-		"context_resolvers":            []any{},
-		"conversation_id":              uuid.NewString(),
-		"current_turn":                 currentTurn,
-		"generate_suggested_questions": false,
-		"intent_name":                  "general_qa_intent",
-		"is_preset":                    true,
-		"model_name":                   model,
-		"session_id":                   uuid.NewString(),
-		"stream":                       stream,
-		"user_input":                   lastMsg.Content,
-		"valid_turns":                  []int{},
-		"variables": fmt.Sprintf(
-			`{"locale":"%s","current_time":"%s"}`,
-			c.Config.Locale,
-			time.Now().Format("20060102 15:04:05 Monday"),
-		),
-	}
-
-	body, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
 	}
 
-	httpReq, _ := http.NewRequestWithContext(
-		ctx,
-		"POST",
-		c.Config.APIBaseURL+"/api/ide/v1/chat",
-		bytes.NewReader(body),
-	)
-	httpReq.Header = c.headers(ideToken)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.Config.APIBaseURL+path, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header = c.headers(ideToken, "text/event-stream")
 
-	return c.HTTPClient.Do(httpReq)
+	resp, err := c.StreamClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+		return nil, &UpstreamError{Mode: mode, Status: resp.StatusCode, Body: string(raw)}
+	}
+	return resp, nil
+}
+
+func canProtocolFallback(err error) bool {
+	upstreamErr, ok := err.(*UpstreamError)
+	if !ok {
+		return false
+	}
+	return upstreamErr.Status == http.StatusNotFound || upstreamErr.Status == http.StatusMethodNotAllowed
 }

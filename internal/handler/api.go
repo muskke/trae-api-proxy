@@ -1,19 +1,18 @@
 package handler
 
 import (
-	"bufio"
+	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
-	"time"
 
 	"github.com/muskke/trae-api-proxy/internal/config"
 	"github.com/muskke/trae-api-proxy/internal/service/trae"
-
-	"github.com/openai/openai-go"
 )
 
 type APIHandler struct {
@@ -22,225 +21,227 @@ type APIHandler struct {
 }
 
 func NewAPIHandler(cfg *config.Config, client *trae.Client) *APIHandler {
-	return &APIHandler{
-		Config: cfg,
-		Client: client,
-	}
+	return &APIHandler{Config: cfg, Client: client}
 }
 
-func bearerToToken(v string) string {
-	return strings.TrimPrefix(v, "Bearer ")
-}
-
-func (h *APIHandler) HandleModels(w http.ResponseWriter, r *http.Request) {
-	reqToken := bearerToToken(r.Header.Get("Authorization"))
-
-	// Authentication check
-	if h.Config.AuthToken != "" {
-		if reqToken != h.Config.AuthToken {
-			http.Error(w, "Unauthorized", 401)
-			return
-		}
-		// If auth matches, we use the internal IDE Token for upstream
-		reqToken = h.Config.IdeToken
-	}
-
-	models, err := h.Client.ListModels(r.Context(), reqToken)
-	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
-		"object": "list",
-		"data":   models,
+func (h *APIHandler) HandleRoot(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"name":   "trae-api-proxy",
+		"status": "ok",
+		"endpoints": []string{
+			"GET /healthz",
+			"GET /status",
+			"GET /v1/models",
+			"POST /v1/chat/completions",
+		},
 	})
 }
 
-func (h *APIHandler) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
-	reqToken := bearerToToken(r.Header.Get("Authorization"))
+func (h *APIHandler) HandleHealth(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.WriteString(w, "ok")
+}
 
-	// Authentication check
-	if h.Config.AuthToken != "" {
-		if reqToken != h.Config.AuthToken {
-			http.Error(w, "Unauthorized", 401)
-			return
-		}
-		// If auth matches, we use the internal IDE Token for upstream
-		reqToken = h.Config.IdeToken
+func (h *APIHandler) HandleStatus(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.authorize(r, w); !ok {
+		return
 	}
-
-	// We decode into a map first or the openai struct.
-	// Since openai-go request structs often have specific pointer fields,
-	// let's use a simpler custom struct for decoding the incoming request
-	// OR use the one from the lib if it JSON unmarshals cleanly.
-	// The official lib uses strict typing.
-	// Let's decode into a struct that matches what we need for Trae,
-	// but mapping from OpenAI format.
-	var req struct {
-		Model    string                         `json:"model"`
-		Messages []openai.ChatCompletionMessage `json:"messages"`
-		Stream   bool                           `json:"stream"`
+	host := h.Config.APIBaseURL
+	if parsed, err := url.Parse(h.Config.APIBaseURL); err == nil && parsed.Host != "" {
+		host = parsed.Host
 	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":                    "ok",
+		"upstream_mode":             h.Config.UpstreamMode,
+		"upstream_host":             host,
+		"upstream_token_configured": h.Config.IdeToken != "",
+		"client_auth_enabled":       h.Config.AuthToken != "",
+		"default_model":             h.Config.DefaultModel,
+	})
+}
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), 400)
+func (h *APIHandler) HandleModels(w http.ResponseWriter, r *http.Request) {
+	upstreamToken, ok := h.authorize(r, w)
+	if !ok {
 		return
 	}
 
-	w.Header().Set("X-Proxied-Model", req.Model)
-
-	// Forward to Trae Client
-	resp, err := h.Client.ChatCompletion(r.Context(), reqToken, req.Model, req.Messages, req.Stream)
+	models, err := h.Client.ListModels(r.Context(), upstreamToken)
 	if err != nil {
-		http.Error(w, err.Error(), 500)
+		h.writeUpstreamError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": models})
+}
+
+func (h *APIHandler) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
+	upstreamToken, ok := h.authorize(r, w)
+	if !ok {
+		return
+	}
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, h.Config.MaxBodyBytes+1))
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "failed to read request body")
+		return
+	}
+	if int64(len(body)) > h.Config.MaxBodyBytes {
+		writeOpenAIError(w, http.StatusRequestEntityTooLarge, "request_too_large", fmt.Sprintf("request body exceeds %d bytes", h.Config.MaxBodyBytes))
+		return
+	}
+
+	var request struct {
+		Model         string            `json:"model"`
+		Messages      []json.RawMessage `json:"messages"`
+		Stream        bool              `json:"stream"`
+		StreamOptions struct {
+			IncludeUsage bool `json:"include_usage"`
+		} `json:"stream_options"`
+	}
+	if err := json.Unmarshal(body, &request); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_json", "request body must be valid JSON")
+		return
+	}
+	if len(request.Messages) == 0 {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "messages must be a non-empty array")
+		return
+	}
+
+	model := h.resolveModel(request.Model)
+	if model == "" {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "model is required")
+		return
+	}
+	w.Header().Set("X-Proxied-Model", model)
+
+	resp, mode, err := h.Client.ChatCompletion(r.Context(), upstreamToken, model, body)
+	if err != nil {
+		h.writeUpstreamError(w, err)
 		return
 	}
 	defer resp.Body.Close()
+	w.Header().Set("X-Upstream-Mode", mode)
 
-	var flusher http.Flusher
-	if req.Stream {
-		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-cache, no-transform")
-		w.Header().Set("Connection", "keep-alive")
-		w.Header().Set("X-Accel-Buffering", "no")
+	if request.Stream {
+		// StreamToOpenAI sets SSE headers before the first write. Errors that happen
+		// after streaming starts are encoded inside the SSE body because status 200
+		// has already been committed by then.
+		if err := trae.StreamToOpenAI(w, resp.Body, model, request.StreamOptions.IncludeUsage); err != nil {
+			log.Printf("stream conversion error: %v", err)
+		}
+		return
+	}
 
-		var ok bool
-		flusher, ok = w.(http.Flusher)
-		if !ok {
-			http.Error(w, "Streaming not supported", 500)
+	result, err := trae.AggregateToOpenAI(resp.Body, model)
+	if err != nil {
+		var streamErr *trae.StreamError
+		if errors.As(err, &streamErr) {
+			writeOpenAIError(w, http.StatusBadGateway, streamErr.Code, streamErr.Message)
 			return
 		}
-
-		w.WriteHeader(http.StatusOK)
-		flusher.Flush()
+		writeOpenAIError(w, http.StatusBadGateway, "upstream_parse_error", err.Error())
+		return
 	}
+	writeJSON(w, http.StatusOK, result)
+}
 
-	reader := bufio.NewReader(resp.Body)
-
-	// Common response structure
-	chunk := openai.ChatCompletionChunk{
-		Object:  "chat.completion.chunk",
-		Model:   req.Model,
-		Created: time.Now().Unix(),
+func (h *APIHandler) resolveModel(requested string) string {
+	model := strings.TrimSpace(requested)
+	if index := strings.Index(model, "__"); index >= 0 {
+		model = model[:index]
 	}
+	if model == "" || strings.EqualFold(model, "auto") {
+		model = h.Config.DefaultModel
+	}
+	if target, ok := h.Config.ModelAliases[strings.ToLower(model)]; ok {
+		return target
+	}
+	return model
+}
 
-	// For non-streaming, we aggregate the content
-	var fullContent strings.Builder
-	var completionID string
-
-	eventName := ""
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			if !req.Stream {
-				log.Printf("error reading stream for aggregation: %v", err)
-				http.Error(w, err.Error(), 500)
-				return
-			}
-			return
+func (h *APIHandler) authorize(r *http.Request, w http.ResponseWriter) (string, bool) {
+	clientToken := requestToken(r)
+	if h.Config.AuthToken != "" {
+		if clientToken == "" || subtle.ConstantTimeCompare([]byte(clientToken), []byte(h.Config.AuthToken)) != 1 {
+			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
+			return "", false
 		}
+		return h.Config.IdeToken, true
+	}
+	if h.Config.IdeToken != "" {
+		return h.Config.IdeToken, true
+	}
+	if clientToken == "" {
+		writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing upstream token; configure TRAE_IDE_TOKEN or send a Bearer token")
+		return "", false
+	}
+	return clientToken, true
+}
 
-		line = strings.TrimRight(line, "\r\n")
-		if line == "" {
-			continue
-		}
-		if strings.HasPrefix(line, "event:") {
-			eventName = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
-			continue
-		}
-		if !strings.HasPrefix(line, "data:") {
-			continue
-		}
-
-		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-
-		if data == "[DONE]" {
-			if req.Stream {
-				fmt.Fprintf(w, "data: [DONE]\n\n")
-				flusher.Flush()
-			}
-			break
-		}
-
-		var evtData map[string]any
-		if err := json.Unmarshal([]byte(data), &evtData); err != nil {
-			log.Printf("stream unmarshal error: %v, data: %s", err, data)
-			continue
-		}
-
-		switch eventName {
-		case "metadata":
-			if id, ok := evtData["prompt_completion_id"]; ok {
-				completionID = fmt.Sprint(id)
-				chunk.ID = completionID
-			}
-
-		case "output":
-			if response, ok := evtData["response"].(string); ok {
-				if req.Stream {
-					chunk.Choices = []openai.ChatCompletionChunkChoice{
-						{
-							Delta: openai.ChatCompletionChunkChoiceDelta{
-								Role:    "assistant",
-								Content: response,
-							},
-						},
-					}
-					out, _ := json.Marshal(chunk)
-					fmt.Fprintf(w, "data: %s\n\n", out)
-					flusher.Flush()
-				} else {
-					fullContent.WriteString(response)
-				}
-			}
-
-		case "done":
-			if req.Stream {
-				chunk.Choices = []openai.ChatCompletionChunkChoice{
-					{
-						Delta: openai.ChatCompletionChunkChoiceDelta{
-							Role: "assistant",
-						},
-						FinishReason: "stop",
-					},
-				}
-				out, _ := json.Marshal(chunk)
-				fmt.Fprintf(w, "data: %s\n\n", out)
-				fmt.Fprintf(w, "data: [DONE]\n\n")
-				flusher.Flush()
-			}
-			// For non-streaming, we break here and return the aggregated response
-			goto Finish
+func requestToken(r *http.Request) string {
+	authorization := strings.TrimSpace(r.Header.Get("Authorization"))
+	if authorization != "" {
+		parts := strings.Fields(authorization)
+		if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") {
+			return strings.TrimSpace(parts[1])
 		}
 	}
+	return strings.TrimSpace(r.Header.Get("X-API-Key"))
+}
 
-Finish:
-	if !req.Stream {
-		resp := openai.ChatCompletion{
-			ID:      completionID,
-			Object:  "chat.completion",
-			Created: time.Now().Unix(),
-			Model:   req.Model,
-			Choices: []openai.ChatCompletionChoice{
-				{
-					Index: 0,
-					Message: openai.ChatCompletionMessage{
-						Role:    "assistant",
-						Content: fullContent.String(),
-					},
-					FinishReason: "stop",
-				},
-			},
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(resp); err != nil {
-			log.Printf("error encoding response: %v", err)
-		}
+func (h *APIHandler) writeUpstreamError(w http.ResponseWriter, err error) {
+	var upstreamErr *trae.UpstreamError
+	if !errors.As(err, &upstreamErr) {
+		writeOpenAIError(w, http.StatusBadGateway, "upstream_error", err.Error())
+		return
 	}
+
+	status := http.StatusBadGateway
+	code := "upstream_error"
+	switch upstreamErr.Status {
+	case http.StatusBadRequest, http.StatusUnprocessableEntity:
+		status = http.StatusBadRequest
+		code = "invalid_request"
+	case http.StatusTooManyRequests:
+		status = http.StatusTooManyRequests
+		code = "rate_limit_exceeded"
+	case http.StatusUnauthorized, http.StatusForbidden:
+		if h.Config.AuthToken == "" && h.Config.IdeToken == "" {
+			status = http.StatusUnauthorized
+			code = "invalid_api_key"
+		} else {
+			code = "upstream_auth_error"
+		}
+	case http.StatusServiceUnavailable, http.StatusBadGateway, http.StatusGatewayTimeout:
+		status = http.StatusServiceUnavailable
+		code = "upstream_unavailable"
+	}
+	writeOpenAIError(w, status, code, upstreamErr.Error())
+}
+
+func writeJSON(w http.ResponseWriter, status int, value any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(value); err != nil {
+		log.Printf("encode response: %v", err)
+	}
+}
+
+func writeOpenAIError(w http.ResponseWriter, status int, code, message string) {
+	typeName := "api_error"
+	switch status {
+	case http.StatusBadRequest, http.StatusRequestEntityTooLarge, http.StatusUnprocessableEntity:
+		typeName = "invalid_request_error"
+	case http.StatusUnauthorized, http.StatusForbidden:
+		typeName = "authentication_error"
+	case http.StatusTooManyRequests:
+		typeName = "rate_limit_error"
+	}
+	writeJSON(w, status, map[string]any{"error": map[string]any{
+		"message": message,
+		"type":    typeName,
+		"code":    code,
+	}})
 }
