@@ -6,5 +6,12 @@ services:
       - .env
     environment:
       BIND: 0.0.0.0
+      TRAE_OAUTH_CALLBACK_BIND: 0.0.0.0
     ports:
       - "127.0.0.1:${PORT:-8000}:${PORT:-8000}"
+      - "127.0.0.1:${TRAE_OAUTH_CALLBACK_PORT:-18080}:${TRAE_OAUTH_CALLBACK_PORT:-18080}"
+    volumes:
+      - trae-api-data:/app/data
+
+volumes:
+  trae-api-data:
