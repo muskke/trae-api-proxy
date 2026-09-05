@@ -23,7 +23,8 @@
 ## Tool execution boundary
 
 - Function/custom/namespace and client-executed `tool_search` calls are protocol bridges only; the proxy does not execute client tools itself. Apply filesystem/shell/MCP permissions in the Codex/Agent runtime that owns those tools.
-- Hosted Responses tools such as direct `type: mcp`, web search, file search, code interpreter, and computer use are rejected rather than forwarded to an unknown runtime.
+- Responses `web_search` is executed by the proxy through its configured search runtime. Model-directed `open_page` / `find_in_page` requests are restricted to public HTTP(S) destinations and reject loopback, private, link-local, multicast, and resolved private addresses. Search backend endpoints are administrator-controlled configuration.
+- Other hosted Responses tools such as direct `type: mcp`, file search, code interpreter, and computer use remain rejected rather than forwarded to an unknown runtime.
 - Avoid exposing the proxy to untrusted clients with a shared `AUTH_TOKEN`: tool schemas and tool outputs can contain sensitive project data even though the proxy does not persist them.
 
 ## Credential lifecycle

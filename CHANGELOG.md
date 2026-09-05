@@ -2,6 +2,29 @@
 
 All notable changes to this project are documented here.
 
+## v0.5.1
+
+### Added
+
+- Proxy-hosted Responses `web_search` runtime for Codex and other Responses clients. `web_search`, `web_search_preview`, and `web_search_preview_2025_03_11` are translated into an internal TRAE function tool, executed by the proxy, fed back to TRAE, and returned as native `web_search_call` output items/events.
+- Public-web search through a no-key DuckDuckGo HTML backend by default, with optional SearXNG JSON backend configuration.
+- Hosted search actions for `search`, `open_page`, and `find_in_page`, including allowed-domain filtering and bounded page/result sizes.
+- Responses streaming events for hosted search: `response.web_search_call.in_progress`, `response.web_search_call.searching`, `response.web_search_call.completed`, plus output-item lifecycle events.
+- `TRAE_WEB_SEARCH_BACKEND`, `TRAE_WEB_SEARCH_ENDPOINT`, `TRAE_WEB_SEARCH_TIMEOUT`, `TRAE_WEB_SEARCH_MAX_RESULTS`, `TRAE_WEB_SEARCH_MAX_PAGE_BYTES`, and `TRAE_HOSTED_TOOL_MAX_STEPS`.
+
+### Changed
+
+- Codex no longer needs hosted `web_search` disabled when using this proxy. Client-executed `tool_search`, function/custom/namespace tools, MCP tool discovery, shell, and apply-patch flows remain unchanged.
+- Responses replay now accepts prior `web_search_call` items instead of rejecting an existing Codex thread after a search turn.
+- Hosted search runs in a bounded hidden tool loop and forces serialized upstream tool decisions for that request, while client-owned tools are still returned to Codex for local execution.
+- `/status` advertises the active hosted web-search backend and hosted-loop limit.
+
+### Security / compatibility
+
+- Model-directed `open_page` / `find_in_page` only accept public HTTP(S) destinations and reject localhost/private/link-local/multicast targets, including resolved private addresses. Search-engine endpoints are administrator-configured.
+- Direct hosted `type: mcp`, file search, code interpreter, computer use, and similar provider runtimes remain outside this proxy. MCP/Skills/Plugins continue through Codex/client-owned function/custom/namespace/tool-search execution.
+- The default DuckDuckGo backend depends on the public HTML endpoint remaining reachable; `TRAE_WEB_SEARCH_BACKEND=searxng` plus `TRAE_WEB_SEARCH_ENDPOINT` can point at an operator-controlled SearXNG instance.
+
 ## v0.5.0
 
 ### Added

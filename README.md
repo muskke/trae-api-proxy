@@ -4,11 +4,11 @@
 
 一个轻量、单账号、零第三方 Go 运行依赖的 TRAE → OpenAI Chat Completions / Responses API 兼容代理。
 
-**v0.5.0 把代理从 Chat Completions 兼容层推进到 Responses / Codex 兼容层。** 在保留 v0.4.4 Global OAuth、自动续期、模型能力学习和稳定 SSE 的基础上，新增 `POST /v1/responses`、Responses 流式事件、function/custom/namespace tool bridge，以及 Codex 当前使用的 client-executed `tool_search` 路径。
+**v0.5.1 在 v0.5.0 Responses / Codex 兼容层上补齐了代理侧 Hosted Web Search。** Codex 可以继续发送 `type: "web_search"`，代理会执行搜索/页面读取、把结果回喂 TRAE，再按 Responses 原生 `web_search_call` 事件返回；无需为了使用本代理而关闭 `web_search` 或 `tool_search`。
 
 > 如果你使用的是 TRAE Global IDE，通常只需要保持 `TRAE_OAUTH_PLATFORM=global`，不要再手工指定旧的 `trae.cn`、SOLO client id 或 v0.4.0 登录 URL。
 
-## ✨ v0.5.0 重点
+## ✨ v0.5.1 重点
 
 - **Responses API**：新增 `POST /v1/responses`，支持非流式与 SSE 流式输出、`instructions`、text input、usage、reasoning、function call 及 tool result 多轮回传。
 - **Codex provider**：支持当前 Codex custom model provider 的 `wire_api = "responses"` HTTP 路径；建议配置 `supports_websockets = false`。
@@ -16,7 +16,8 @@
 - **Namespace tools**：Responses `namespace` 下的 function/custom 工具会安全扁平化给 TRAE，并在返回时恢复 namespace，便于 Codex/MCP 的客户端调度。
 - **Client-executed tool_search**：支持 Codex 当前用于延迟发现 MCP/插件工具的 `tool_search` → `tool_search_call` → `tool_search_output` 流程；搜索结果里的延迟加载工具会在下一轮重新注入 TRAE。
 - **Responses 流事件**：输出 `response.created`、`response.in_progress`、`response.output_item.*`、`response.output_text.*`、function/custom tool delta/done 以及 `response.completed` / `response.failed`。
-- **明确的托管工具边界**：`type: mcp`、`web_search`、`file_search`、`code_interpreter` 等需要服务端执行环境的 hosted tools 会返回清晰的 400，而不是伪装支持；Codex/Agent 客户端本地执行的 MCP/function/custom tools 则走上述桥接。
+- **Hosted Web Search Runtime**：支持 Responses `web_search` / preview variants。TRAE 通过内部工具选择 `search`、`open_page`、`find_in_page`，代理执行后继续同一次隐藏工具循环，并向 Codex 输出标准 `web_search_call` 生命周期事件。
+- **不关闭 Codex 工具**：`tool_search` 仍由 Codex 客户端执行，function/custom/namespace、MCP 延迟工具、shell/apply_patch 等路径保持；只有真正需要其他服务端 runtime 的 hosted `mcp` / file search / code interpreter / computer use 仍明确报不支持。
 
 - **SSE 辅助事件容错**：`progress_notice`、heartbeat、未来未知事件即使携带 string/null/非 JSON 数据，也不会再把正常聊天流打断；只有真正需要对象结构的核心事件才严格解析。
 - **模型状态跨重启持久化**：`usable` / `unavailable` 学习结果默认原子写入 `data/model-status.json`，重启后继续使用，过期条目自动回到 `unknown`。
@@ -311,7 +312,7 @@ curl -X DELETE 'http://127.0.0.1:8000/v1/models/status?model=DeepSeek-V4-Flash' 
   -H 'Authorization: Bearer my-local-proxy-key'
 ```
 
-> v0.5.0 仍不会在启动时逐模型主动探测，因此不会为了“验证列表”自动消耗额度。`unknown` 只有在真实请求成功/明确失败后才会变成 `usable` / `unavailable`；学习结果会持久化到本地状态文件并受 TTL 控制。
+> v0.5.1 仍不会在启动时逐模型主动探测，因此不会为了“验证列表”自动消耗额度。`unknown` 只有在真实请求成功/明确失败后才会变成 `usable` / `unavailable`；学习结果会持久化到本地状态文件并受 TTL 控制。
 
 ### Reasoning 输出兼容
 
@@ -466,27 +467,78 @@ supports_websockets = false
 supports_standalone_web_search = false
 ```
 
+如果是从 Windows 开始菜单/快捷方式启动 Codex Desktop，Desktop 不会继承 Git Bash 临时 `export` 的变量。可以改用 Windows 用户环境变量 + `env_http_headers`，或先用静态 header 排查：
+
+```toml
+[model_providers.trae_proxy]
+name = "TRAE Proxy"
+base_url = "http://127.0.0.1:8000/v1"
+wire_api = "responses"
+requires_openai_auth = false
+supports_websockets = false
+supports_standalone_web_search = false
+http_headers = { "X-API-Key" = "my-local-proxy-key" }
+```
+
+确认后建议把 key 移出 TOML，使用 Codex 的环境 header 映射。
+
 然后可先做最小验证：
 
 ```bash
 codex exec --skip-git-repo-check "Reply with exactly: CODEX_OK"
 ```
 
-Codex 的 shell / apply_patch / 普通 function 工具由 Codex 客户端本地执行，代理负责把模型 tool call 往返转换。对于大量 MCP/Plugin 工具，v0.5.0 也支持 Codex 的 client-executed `tool_search`：代理只负责让模型发起搜索调用并接收 Codex 返回的工具定义，MCP 网络连接与工具真正执行仍由 Codex 负责。
+Codex 的 shell / apply_patch / 普通 function 工具由 Codex 客户端本地执行，代理负责把模型 tool call 往返转换。对于大量 MCP/Plugin 工具，v0.5.1 也支持 Codex 的 client-executed `tool_search`：代理只负责让模型发起搜索调用并接收 Codex 返回的工具定义，MCP 网络连接与工具真正执行仍由 Codex 负责。
 
 当前 Codex CLI/TUI 的 custom provider 路径最适合作为首选验收环境。Codex Desktop 也读取同一套 provider 配置体系，但当前桌面端对 custom provider 的模型选择/既有会话存在上游客户端限制，因此本项目不把 Desktop 宣称为已完整兼容；应以你所使用的 Codex Desktop 版本实测为准。
 
+### Hosted Web Search
+
+v0.5.1 可以直接接住 Codex 发来的 `type: "web_search"`，不需要在 Codex 配置中关闭搜索。默认使用无需 API key 的 DuckDuckGo HTML 搜索后端；也可切换到自建/可信 SearXNG：
+
+```dotenv
+TRAE_WEB_SEARCH_BACKEND=duckduckgo
+TRAE_WEB_SEARCH_ENDPOINT=https://html.duckduckgo.com/html/
+TRAE_WEB_SEARCH_TIMEOUT=20s
+TRAE_WEB_SEARCH_MAX_RESULTS=8
+TRAE_WEB_SEARCH_MAX_PAGE_BYTES=2097152
+TRAE_HOSTED_TOOL_MAX_STEPS=6
+```
+
+SearXNG 示例：
+
+```dotenv
+TRAE_WEB_SEARCH_BACKEND=searxng
+TRAE_WEB_SEARCH_ENDPOINT=https://search.example.com
+```
+
+执行流程：
+
+```text
+Codex web_search tool
+        ↓
+TRAE 选择 search/open_page/find_in_page
+        ↓
+trae-api-proxy Hosted Web Search Runtime
+        ↓
+搜索结果作为隐藏 tool result 回喂 TRAE
+        ↓
+response.web_search_call.* + 最终 answer
+```
+
+`open_page` / `find_in_page` 只允许公共 HTTP(S) 地址，并拒绝 localhost、私网、link-local、multicast 以及 DNS 解析到私网的目标。搜索后端地址是管理员配置项，不由模型指定。
+
 ### 当前 Responses 边界
 
-v0.5.0 是**无状态 text + client-owned tools** 的 Responses 兼容实现。当前支持 `input` string / text message items、`instructions`、function/custom/namespace、client `tool_search`、tool outputs、reasoning 与 usage；以下能力仍未做服务端实现：
+v0.5.1 是**无状态 text + client-owned tools + hosted web_search** 的 Responses 兼容实现。当前支持 `input` string / text message items、`instructions`、function/custom/namespace、client `tool_search`、hosted `web_search`、tool outputs、reasoning 与 usage；以下能力仍未做服务端实现：
 
 - `store=true`、`previous_response_id`、conversation persistence、background response；
 - image/file/audio input、Realtime/WebSocket Responses；
 - Structured Outputs `json_schema`；
-- hosted `mcp` / web search / file search / code interpreter / computer use；
+- hosted `mcp` / file search / code interpreter / computer use；
 - Responses retrieve/delete/cancel/compact 等持久化资源接口。
 
-如果 Agent/Codex 把 MCP、Skills、Plugins 转换为本地 function/custom/namespace/tool_search 并由客户端执行，可以使用本代理；如果请求直接要求代理执行 `type: "mcp"` 等 hosted tool，则会明确返回不支持。
+MCP、Skills、Plugins 仍推荐由 Codex/Agent 转换为客户端 function/custom/namespace/tool_search 并在客户端执行；`web_search` 是当前唯一由本代理直接提供执行 runtime 的 hosted tool。
 
 ## 🗺️ 模型映射
 
@@ -521,6 +573,12 @@ TRAE_MODEL_ALIASES=sonnet=glm-5.2;fast=glm-5-turbo
 | `TRAE_MODEL_SUCCESS_TTL` | `6h` | 成功调用模型的正缓存时间 |
 | `TRAE_MODEL_STATUS_FILE` | `./data/model-status.json` | 持久化当前账号模型能力状态；与 OAuth 凭证同属本地 `data/` |
 | `TRAE_REASONING_MODE` | `preserve` | `preserve` / `merge` / `drop` reasoning 输出策略 |
+| `TRAE_WEB_SEARCH_BACKEND` | `duckduckgo` | Hosted Web Search 后端：`duckduckgo` / `searxng` |
+| `TRAE_WEB_SEARCH_ENDPOINT` | `https://html.duckduckgo.com/html/` | 搜索后端地址；SearXNG 时填写实例基址 |
+| `TRAE_WEB_SEARCH_TIMEOUT` | `20s` | 单次搜索/页面读取超时 |
+| `TRAE_WEB_SEARCH_MAX_RESULTS` | `8` | 单轮最大搜索结果数 |
+| `TRAE_WEB_SEARCH_MAX_PAGE_BYTES` | `2097152` | 页面读取上限 |
+| `TRAE_HOSTED_TOOL_MAX_STEPS` | `6` | 单个 Responses 请求内 hosted tool 隐藏循环上限 |
 | `TRAE_REQUEST_TIMEOUT` | `120s` | 短 JSON 请求总超时 |
 | `TRAE_RESPONSE_HEADER_TIMEOUT` | `120s` | 上游首包/响应头超时 |
 | `MAX_BODY_BYTES` | `8388608` | 请求体上限（8 MiB） |
@@ -595,6 +653,17 @@ make check
 - Codex 风格 `tool_search` / `tool_search_output` 与延迟 namespace 工具加载
 - Codex 当前 request envelope 中的 `store=false`、reasoning、include、service tier、prompt cache 等兼容字段
 - 本地 `AUTH_TOKEN` 与上游凭证隔离
+
+## ⬆️ 从 v0.5.0 升级到 v0.5.1
+
+OAuth 凭证、模型状态和 Codex provider 配置都可以原样保留，不需要重新登录 TRAE。新增的 Hosted Web Search 默认开箱可用；如果网络环境无法访问 DuckDuckGo HTML，可以只配置搜索后端，不需要关闭 Codex 的 `web_search` / `tool_search`：
+
+```dotenv
+TRAE_WEB_SEARCH_BACKEND=searxng
+TRAE_WEB_SEARCH_ENDPOINT=https://your-searxng.example
+```
+
+升级后建议直接用原 Codex 会话或新会话触发一次需要联网的信息查询，并观察 Responses stream 中是否出现 `web_search_call`。
 
 ## ⬆️ 从 v0.4.4 升级到 v0.5.0
 
@@ -714,7 +783,8 @@ TRAE_OAUTH_PLATFORM=global
 ├── internal/config/           # 平台路由 / product.json 发现 / 配置
 ├── internal/handler/          # HTTP API / 鉴权 / 错误映射
 ├── internal/middleware/       # request ID / CORS / 日志 / recovery
-├── internal/service/trae/     # Agent upstream / SSE / payload
+├── internal/service/trae/     # Agent upstream / SSE / Responses / hosted tool loop
+├── internal/service/websearch/ # Hosted web_search runtime / page fetch
 ├── pkg/utils/                 # dotenv 工具
 ├── data/                      # OAuth 凭证 + 模型状态（Git ignored）
 ├── .github/workflows/ci.yml
@@ -727,7 +797,7 @@ TRAE_OAUTH_PLATFORM=global
 ## ⚠️ 兼容边界
 
 - 当前同时支持 Chat Completions 与无状态 HTTP Responses create；不实现 embeddings、images、audio、Realtime/WebSocket、Responses 持久化资源或多账号池。
-- `type: "mcp"` / web search / file search / code interpreter 等 hosted tools 仍需要真正的服务端执行 runtime；v0.5.0 只支持由 Codex/Agent 客户端执行的 function/custom/namespace/tool_search 路径。
+- Responses `web_search` 已由代理提供 hosted runtime；`type: "mcp"` / file search / code interpreter / computer use 等其他 hosted tools 仍需要各自服务端执行环境。Codex/Agent 客户端执行的 function/custom/namespace/tool_search 路径继续支持。
 - access token 可以自动刷新，但 refresh token 自身仍可能过期、被撤销或因账号状态变化失效；此时需要重新访问 `/auth/login`。
 - TRAE 登录/Agent 上游并非公开稳定 API。当前版本已把区域、产品、LoginGuidance、Client ID、路径、客户端版本和模型能力状态尽可能动态化/可配置，但后续仍可能随 IDE 更新调整。
 
@@ -742,7 +812,7 @@ TRAE Global and TRAE SOLO share the `/api/agent/v3/llm_utils_chat` endpoint but 
 
 For Global accounts, the default core endpoint is now `https://coresg-normal.trae.ai` for SG and `https://coreva-normal.trae.ai` for US. Existing v0.4.1 managed credentials that contain the generated `trae-api-sg.mchost.guru` or `trae-api-us.mchost.guru` values are migrated automatically on startup; custom `TRAE_API_BASE_URL` overrides are preserved.
 
-After upgrading from v0.4.1, a new browser login is not required. Restart the proxy and retry `/v1/models`, `/v1/chat/completions`, or v0.5.0 `/v1/responses`.
+After upgrading from v0.4.1, a new browser login is not required. Restart the proxy and retry `/v1/models`, `/v1/chat/completions`, or v0.5.1 `/v1/responses`.
 
 ## v0.4.3 Model availability learning
 
