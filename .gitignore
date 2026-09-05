@@ -1,4 +1,4 @@
-# Binaries
+# Binaries / build output
 *.exe
 *.exe~
 *.dll
@@ -6,6 +6,7 @@
 *.dylib
 *.test
 *.out
+bin/
 
 # Generic
 .DS_Store
@@ -22,5 +23,5 @@ vendor/
 go.work
 go.work.sum
 
-# Project
+# Project secrets
 .env

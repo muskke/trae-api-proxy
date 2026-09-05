@@ -1,0 +1,10 @@
+services:
+  trae-api-proxy:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      BIND: 0.0.0.0
+    ports:
+      - "127.0.0.1:${PORT:-8000}:${PORT:-8000}"
