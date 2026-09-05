@@ -61,14 +61,21 @@ func (e *UpstreamError) Error() string {
 	return fmt.Sprintf("upstream %s returned HTTP %d: %s", e.Mode, e.Status, body)
 }
 
+type modelCacheEntry struct {
+	Models   []Model
+	CachedAt time.Time
+}
+
 type Client struct {
 	Config       *config.Config
 	HTTPClient   *http.Client
 	StreamClient *http.Client
 
-	modelMu       sync.RWMutex
-	modelCache    []Model
-	modelCachedAt time.Time
+	modelMu    sync.RWMutex
+	modelCache map[string]modelCacheEntry
+
+	capabilityMu      sync.RWMutex
+	modelCapabilities map[string]modelCapability
 }
 
 func NewClient(cfg *config.Config) *Client {
@@ -87,7 +94,9 @@ func NewClient(cfg *config.Config) *Client {
 	transport.ResponseHeaderTimeout = cfg.HeaderTimeout
 
 	return &Client{
-		Config: cfg,
+		Config:            cfg,
+		modelCache:        make(map[string]modelCacheEntry),
+		modelCapabilities: make(map[string]modelCapability),
 		HTTPClient: &http.Client{
 			Timeout:   cfg.RequestTimeout,
 			Transport: transport,
@@ -164,13 +173,15 @@ func currentFunction(session Session, model string) string {
 	return standardChatFunction
 }
 
-func (c *Client) canonicalModel(requested string) string {
+func (c *Client) canonicalModel(session Session, requested string) string {
 	requested = strings.TrimSpace(requested)
 	if requested == "" || strings.EqualFold(requested, "auto") {
 		return requested
 	}
+	scope := sessionScope(session)
 	c.modelMu.RLock()
-	models := append([]Model(nil), c.modelCache...)
+	entry := c.modelCache[scope]
+	models := append([]Model(nil), entry.Models...)
 	c.modelMu.RUnlock()
 	for _, model := range models {
 		if strings.EqualFold(strings.TrimSpace(model.ID), requested) {
@@ -181,13 +192,15 @@ func (c *Client) canonicalModel(requested string) string {
 }
 
 func (c *Client) ListModels(ctx context.Context, session Session) ([]Model, error) {
+	scope := sessionScope(session)
 	c.modelMu.RLock()
-	if len(c.modelCache) > 0 && time.Since(c.modelCachedAt) < c.Config.ModelCacheTTL {
-		cached := append([]Model(nil), c.modelCache...)
+	entry := c.modelCache[scope]
+	if len(entry.Models) > 0 && time.Since(entry.CachedAt) < c.Config.ModelCacheTTL {
+		cached := append([]Model(nil), entry.Models...)
 		c.modelMu.RUnlock()
 		return cached, nil
 	}
-	stale := append([]Model(nil), c.modelCache...)
+	stale := append([]Model(nil), entry.Models...)
 	c.modelMu.RUnlock()
 
 	models, err := c.fetchModels(ctx, session)
@@ -199,8 +212,10 @@ func (c *Client) ListModels(ctx context.Context, session Session) ([]Model, erro
 	}
 
 	c.modelMu.Lock()
-	c.modelCache = append([]Model(nil), models...)
-	c.modelCachedAt = time.Now()
+	if c.modelCache == nil {
+		c.modelCache = make(map[string]modelCacheEntry)
+	}
+	c.modelCache[scope] = modelCacheEntry{Models: append([]Model(nil), models...), CachedAt: time.Now()}
 	c.modelMu.Unlock()
 	return models, nil
 }
@@ -316,7 +331,7 @@ func (c *Client) fetchModelsMode(ctx context.Context, session Session, mode stri
 // protocol. The upstream is always asked for SSE; non-streaming client requests
 // are aggregated by the handler so both modes share the same parser.
 func (c *Client) ChatCompletion(ctx context.Context, session Session, model string, rawBody []byte) (*http.Response, string, error) {
-	model = c.canonicalModel(model)
+	model = c.canonicalModel(session, model)
 	switch c.Config.UpstreamMode {
 	case "solo":
 		resp, err := c.chatMode(ctx, session, model, rawBody, "solo")
@@ -372,8 +387,7 @@ func (c *Client) chatMode(ctx context.Context, session Session, model string, ra
 
 func (c *Client) InvalidateModelCache() {
 	c.modelMu.Lock()
-	c.modelCache = nil
-	c.modelCachedAt = time.Time{}
+	c.modelCache = make(map[string]modelCacheEntry)
 	c.modelMu.Unlock()
 }
 

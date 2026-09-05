@@ -96,6 +96,8 @@ func validConfig() *Config {
 		HeaderTimeout:     time.Second,
 		ShutdownTimeout:   time.Second,
 		ModelCacheTTL:     time.Minute,
+		ModelFailureTTL:   time.Minute,
+		ModelSuccessTTL:   time.Hour,
 		OAuthRefreshSkew:  time.Hour,
 		OAuthRefreshEvery: time.Minute,
 		OAuthLoginTTL:     time.Minute,
@@ -128,5 +130,19 @@ func TestParseInstalledProductSelectsPlatformClient(t *testing.T) {
 	solo := parseInstalledProduct(root, "global-solo")
 	if solo.ClientID != "solo-client" {
 		t.Fatalf("global SOLO client id = %q", solo.ClientID)
+	}
+}
+
+func TestValidateRejectsNonPositiveModelCapabilityTTLs(t *testing.T) {
+	cfg := validConfig()
+	cfg.ModelFailureTTL = 0
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected zero TRAE_MODEL_FAILURE_TTL to fail validation")
+	}
+
+	cfg = validConfig()
+	cfg.ModelSuccessTTL = -time.Second
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected negative TRAE_MODEL_SUCCESS_TTL to fail validation")
 	}
 }

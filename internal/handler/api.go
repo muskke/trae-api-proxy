@@ -40,6 +40,8 @@ func (h *APIHandler) HandleRoot(w http.ResponseWriter, _ *http.Request) {
 			"POST /auth/refresh",
 			"POST /auth/logout",
 			"GET /v1/models",
+			"GET /v1/models/status",
+			"DELETE /v1/models/status",
 			"POST /v1/chat/completions",
 		},
 	})
@@ -124,6 +126,7 @@ func (h *APIHandler) HandleAuthLogout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.Client.InvalidateModelCache()
+	h.Client.InvalidateModelCapabilities()
 	writeJSON(w, http.StatusOK, map[string]any{"status": "logged_out"})
 }
 
@@ -133,24 +136,62 @@ func (h *APIHandler) HandleModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	models, err := h.Client.ListModels(r.Context(), session)
-	if trae.IsUpstreamAuthError(err) && session.Source == "oauth" {
-		if refreshErr := h.Auth.ForceRefresh(r.Context()); refreshErr != nil {
-			h.writeAuthLifecycleError(w, refreshErr)
-			return
-		}
-		h.Client.InvalidateModelCache()
-		session, ok = h.authorizeUpstream(r, w)
-		if !ok {
-			return
-		}
-		models, err = h.Client.ListModels(r.Context(), session)
+	models, session, err := h.listModelsWithRefresh(r, w, session)
+	if err != nil {
+		h.writeModelListError(w, err)
+		return
 	}
+	availability := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("availability")))
+	if availability == "" {
+		availability = "available"
+	}
+	models, err = h.Client.FilterModels(session, models, availability)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	w.Header().Set("X-Trae-Model-Filter", availability)
+	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": models})
+}
+
+func (h *APIHandler) HandleModelStatus(w http.ResponseWriter, r *http.Request) {
+	session, ok := h.authorizeUpstream(r, w)
+	if !ok {
+		return
+	}
+	_, session, err := h.listModelsWithRefresh(r, w, session)
+	if err != nil {
+		h.writeModelListError(w, err)
+		return
+	}
+	statuses, err := h.Client.ModelStatuses(r.Context(), session)
 	if err != nil {
 		h.writeUpstreamError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": models})
+	summary := map[string]int{"usable": 0, "unknown": 0, "unavailable": 0}
+	for _, status := range statuses {
+		summary[string(status.Status)]++
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"object":  "list",
+		"data":    statuses,
+		"summary": summary,
+	})
+}
+
+func (h *APIHandler) HandleModelStatusReset(w http.ResponseWriter, r *http.Request) {
+	session, ok := h.authorizeUpstream(r, w)
+	if !ok {
+		return
+	}
+	model := strings.TrimSpace(r.URL.Query().Get("model"))
+	removed := h.Client.ResetModelAvailability(session, model)
+	response := map[string]any{"status": "ok", "removed": removed}
+	if model != "" {
+		response["model"] = model
+	}
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (h *APIHandler) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -191,8 +232,19 @@ func (h *APIHandler) HandleChatCompletions(w http.ResponseWriter, r *http.Reques
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "model is required")
 		return
 	}
+	status := h.Client.ModelAvailability(session, model)
+	if status.ID != "" {
+		model = status.ID
+	}
 	w.Header().Set("X-Proxied-Model", model)
+	w.Header().Set("X-Trae-Function", h.Client.FunctionFor(session, model))
+	w.Header().Set("X-Trae-Model-Status", string(status.Status))
+	if status.Status == trae.ModelUnavailable {
+		writeOpenAIError(w, http.StatusBadRequest, "model_unavailable", fmt.Sprintf("model %q is temporarily marked unavailable for this TRAE account; retry after the cache expires or clear it with DELETE /v1/models/status?model=%s", model, url.QueryEscape(model)))
+		return
+	}
 
+	capabilitySafe := isModelCapabilitySafeRequest(body)
 	resp, mode, err := h.Client.ChatCompletion(r.Context(), session, model, body)
 	if trae.IsUpstreamAuthError(err) && session.Source == "oauth" {
 		if refreshErr := h.Auth.ForceRefresh(r.Context()); refreshErr != nil {
@@ -206,6 +258,10 @@ func (h *APIHandler) HandleChatCompletions(w http.ResponseWriter, r *http.Reques
 		resp, mode, err = h.Client.ChatCompletion(r.Context(), session, model, body)
 	}
 	if err != nil {
+		if h.recordModelError(session, model, err, capabilitySafe) {
+			writeOpenAIError(w, http.StatusBadRequest, "model_unavailable", fmt.Sprintf("model %q was rejected by TRAE for a minimal chat request", model))
+			return
+		}
 		h.writeUpstreamError(w, err)
 		return
 	}
@@ -217,13 +273,20 @@ func (h *APIHandler) HandleChatCompletions(w http.ResponseWriter, r *http.Reques
 		// after streaming starts are encoded inside the SSE body because status 200
 		// has already been committed by then.
 		if err := trae.StreamToOpenAI(w, resp.Body, model, request.StreamOptions.IncludeUsage); err != nil {
+			h.recordModelError(session, model, err, capabilitySafe)
 			log.Printf("stream conversion error: %v", err)
+			return
 		}
+		h.Client.RecordModelSuccess(session, model)
 		return
 	}
 
 	result, err := trae.AggregateToOpenAI(resp.Body, model)
 	if err != nil {
+		if h.recordModelError(session, model, err, capabilitySafe) {
+			writeOpenAIError(w, http.StatusBadRequest, "model_unavailable", fmt.Sprintf("model %q was rejected by TRAE for a minimal chat request", model))
+			return
+		}
 		var streamErr *trae.StreamError
 		if errors.As(err, &streamErr) {
 			writeOpenAIError(w, http.StatusBadGateway, streamErr.Code, streamErr.Message)
@@ -232,7 +295,139 @@ func (h *APIHandler) HandleChatCompletions(w http.ResponseWriter, r *http.Reques
 		writeOpenAIError(w, http.StatusBadGateway, "upstream_parse_error", err.Error())
 		return
 	}
+	h.Client.RecordModelSuccess(session, model)
 	writeJSON(w, http.StatusOK, result)
+}
+
+type modelListAuthError struct {
+	err error
+}
+
+func (e *modelListAuthError) Error() string { return e.err.Error() }
+func (e *modelListAuthError) Unwrap() error { return e.err }
+
+func (h *APIHandler) listModelsWithRefresh(r *http.Request, w http.ResponseWriter, session trae.Session) ([]trae.Model, trae.Session, error) {
+	models, err := h.Client.ListModels(r.Context(), session)
+	if trae.IsUpstreamAuthError(err) && session.Source == "oauth" {
+		if refreshErr := h.Auth.ForceRefresh(r.Context()); refreshErr != nil {
+			return nil, session, &modelListAuthError{err: refreshErr}
+		}
+		h.Client.InvalidateModelCache()
+		refreshed, ok := h.authorizeUpstream(r, w)
+		if !ok {
+			return nil, session, &modelListAuthError{err: traeauth.ErrReauthRequired}
+		}
+		session = refreshed
+		models, err = h.Client.ListModels(r.Context(), session)
+	}
+	return models, session, err
+}
+
+func (h *APIHandler) writeModelListError(w http.ResponseWriter, err error) {
+	var authErr *modelListAuthError
+	if errors.As(err, &authErr) {
+		h.writeAuthLifecycleError(w, authErr.err)
+		return
+	}
+	h.writeUpstreamError(w, err)
+}
+
+func (h *APIHandler) recordModelError(session trae.Session, model string, err error, capabilitySafe bool) bool {
+	code, message := modelErrorDetails(err)
+	definitive := capabilitySafe && isModelParameterError(code, message)
+	h.Client.RecordModelFailure(session, model, code, message, definitive)
+	return definitive
+}
+
+func modelErrorDetails(err error) (string, string) {
+	var streamErr *trae.StreamError
+	if errors.As(err, &streamErr) {
+		return strings.TrimSpace(streamErr.Code), strings.TrimSpace(streamErr.Message)
+	}
+	var upstreamErr *trae.UpstreamError
+	if errors.As(err, &upstreamErr) {
+		body := strings.TrimSpace(upstreamErr.Body)
+		var raw map[string]any
+		if json.Unmarshal([]byte(body), &raw) == nil {
+			if nested, ok := raw["error"].(map[string]any); ok {
+				code := scalarErrorValue(nested["code"])
+				message := scalarErrorValue(nested["message"])
+				if code != "" || message != "" {
+					return code, message
+				}
+			}
+			return scalarErrorValue(raw["code"]), firstErrorValue(raw["message"], raw["msg"])
+		}
+		return fmt.Sprintf("http_%d", upstreamErr.Status), body
+	}
+	return "", strings.TrimSpace(err.Error())
+}
+
+func scalarErrorValue(value any) string {
+	switch v := value.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case float64:
+		return fmt.Sprintf("%.0f", v)
+	case json.Number:
+		return v.String()
+	case nil:
+		return ""
+	default:
+		return strings.TrimSpace(fmt.Sprint(v))
+	}
+}
+
+func firstErrorValue(values ...any) string {
+	for _, value := range values {
+		if text := scalarErrorValue(value); text != "" {
+			return text
+		}
+	}
+	return ""
+}
+
+func isModelParameterError(code, message string) bool {
+	if strings.TrimSpace(code) == "4001" {
+		return true
+	}
+	message = strings.ToLower(strings.TrimSpace(message))
+	return strings.Contains(message, "param is invalid") && strings.Contains(message, "valid param")
+}
+
+func isModelCapabilitySafeRequest(body []byte) bool {
+	var raw map[string]json.RawMessage
+	if json.Unmarshal(body, &raw) != nil {
+		return false
+	}
+	allowed := map[string]bool{
+		"model": true, "messages": true, "stream": true, "stream_options": true,
+	}
+	for key := range raw {
+		if !allowed[key] {
+			return false
+		}
+	}
+	var messages []map[string]json.RawMessage
+	if json.Unmarshal(raw["messages"], &messages) != nil || len(messages) == 0 {
+		return false
+	}
+	for _, message := range messages {
+		for key := range message {
+			if key != "role" && key != "content" {
+				return false
+			}
+		}
+		var role string
+		var content string
+		if json.Unmarshal(message["role"], &role) != nil || strings.TrimSpace(role) == "" {
+			return false
+		}
+		if json.Unmarshal(message["content"], &content) != nil {
+			return false
+		}
+	}
+	return true
 }
 
 func (h *APIHandler) resolveModel(requested string) string {

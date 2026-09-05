@@ -44,6 +44,8 @@ func main() {
 	mux.HandleFunc("POST /auth/refresh", h.HandleAuthRefresh)
 	mux.HandleFunc("POST /auth/logout", h.HandleAuthLogout)
 	mux.HandleFunc("GET /v1/models", h.HandleModels)
+	mux.HandleFunc("GET /v1/models/status", h.HandleModelStatus)
+	mux.HandleFunc("DELETE /v1/models/status", h.HandleModelStatusReset)
 	mux.HandleFunc("POST /v1/chat/completions", h.HandleChatCompletions)
 
 	wrapped := middleware.Chain(

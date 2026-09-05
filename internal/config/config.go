@@ -46,6 +46,8 @@ const (
 	defaultHeaderTimeout             = 120 * time.Second
 	defaultShutdownTimeout           = 10 * time.Second
 	defaultModelCacheTTL             = time.Hour
+	defaultModelFailureTTL           = 30 * time.Minute
+	defaultModelSuccessTTL           = 6 * time.Hour
 	defaultRefreshSkew               = 24 * time.Hour
 	defaultRefreshInterval           = 15 * time.Minute
 	defaultLoginTTL                  = 10 * time.Minute
@@ -94,6 +96,8 @@ type Config struct {
 	HeaderTimeout      time.Duration
 	ShutdownTimeout    time.Duration
 	ModelCacheTTL      time.Duration
+	ModelFailureTTL    time.Duration
+	ModelSuccessTTL    time.Duration
 	MaxBodyBytes       int64
 	CORSAllowOrigin    string
 
@@ -163,6 +167,8 @@ func Load() *Config {
 		HeaderTimeout:      envDuration("TRAE_RESPONSE_HEADER_TIMEOUT", defaultHeaderTimeout),
 		ShutdownTimeout:    envDuration("SHUTDOWN_TIMEOUT", defaultShutdownTimeout),
 		ModelCacheTTL:      envDuration("TRAE_MODEL_CACHE_TTL", defaultModelCacheTTL),
+		ModelFailureTTL:    envDuration("TRAE_MODEL_FAILURE_TTL", defaultModelFailureTTL),
+		ModelSuccessTTL:    envDuration("TRAE_MODEL_SUCCESS_TTL", defaultModelSuccessTTL),
 		MaxBodyBytes:       envInt64("MAX_BODY_BYTES", defaultMaxBodyBytes),
 		CORSAllowOrigin:    os.Getenv("CORS_ALLOW_ORIGIN"),
 
@@ -339,8 +345,8 @@ func (c *Config) Validate() error {
 	if c.MaxBodyBytes <= 0 {
 		return fmt.Errorf("MAX_BODY_BYTES must be greater than zero")
 	}
-	if c.RequestTimeout <= 0 || c.HeaderTimeout <= 0 || c.ShutdownTimeout <= 0 || c.ModelCacheTTL <= 0 || c.OAuthRefreshSkew <= 0 || c.OAuthRefreshEvery <= 0 || c.OAuthLoginTTL <= 0 {
-		return fmt.Errorf("timeout values, refresh intervals, and TRAE_MODEL_CACHE_TTL must be greater than zero")
+	if c.RequestTimeout <= 0 || c.HeaderTimeout <= 0 || c.ShutdownTimeout <= 0 || c.ModelCacheTTL <= 0 || c.ModelFailureTTL <= 0 || c.ModelSuccessTTL <= 0 || c.OAuthRefreshSkew <= 0 || c.OAuthRefreshEvery <= 0 || c.OAuthLoginTTL <= 0 {
+		return fmt.Errorf("timeout values, refresh intervals, and model cache TTLs must be greater than zero")
 	}
 	return nil
 }

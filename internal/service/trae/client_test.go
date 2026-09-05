@@ -258,5 +258,7 @@ func testClientConfig(baseURL string) *config.Config {
 		RequestTimeout:     3 * time.Second,
 		HeaderTimeout:      3 * time.Second,
 		ModelCacheTTL:      time.Minute,
+		ModelFailureTTL:    time.Minute,
+		ModelSuccessTTL:    time.Hour,
 	}
 }
