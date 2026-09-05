@@ -2,6 +2,28 @@
 
 All notable changes to this project are documented here.
 
+## v0.5.0
+
+### Added
+
+- `POST /v1/responses` with non-streaming Responses objects and HTTP SSE streaming through the existing TRAE `chat_v3` transport.
+- Responses request translation for `instructions`, text `input`, developer/system/user/assistant messages, `max_output_tokens`, sampling fields, reasoning metadata, function calls, and tool outputs.
+- Responses stream events for `response.created`, `response.in_progress`, output-item/content-part lifecycle, text deltas, reasoning text, function/custom tool input, `response.completed`, and `response.failed`.
+- Function, custom/freeform, and namespace tool bridges. Custom/freeform tools such as Codex `apply_patch` are transported through a temporary function schema and restored as `custom_tool_call` at the Responses boundary.
+- Client-executed `tool_search` support for current Codex deferred tool discovery, including `tool_search_call`, `tool_search_output`, and injection of dynamically loaded function/custom/namespace tools into the following TRAE request.
+- Codex-oriented regression coverage for current Responses request envelope fields and function/custom/tool-search round trips.
+
+### Changed
+
+- Root/status discovery now advertises both `chat_completions` and `responses` wire APIs.
+- Responses traffic uses the same OAuth refresh recovery, per-account model capability learning, model aliases, Global region routing, request limits, and reasoning-mode controls as Chat Completions.
+- Current Codex custom providers can target the proxy with `wire_api = "responses"` and `supports_websockets = false`; Chat Completions remains available for existing clients.
+
+### Compatibility boundaries
+
+- The Responses endpoint is stateless and text/client-tool oriented. `store=true`, `previous_response_id`, conversation persistence, background mode, image/file/audio input, structured `json_schema` output, and Responses resource/realtime endpoints are not implemented.
+- Server-hosted tools (`type: mcp`, web/file search, code interpreter, computer use, and similar) are rejected clearly because the proxy does not contain those execution runtimes. Client-owned Codex/Agent MCP tools can operate when surfaced as function/custom/namespace tools or through client-executed `tool_search`.
+
 ## v0.4.4
 
 ### Fixed

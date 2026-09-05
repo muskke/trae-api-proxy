@@ -2,13 +2,21 @@
 
 ![Trae API Proxy Banner](assets/banner.png)
 
-一个轻量、单账号、零第三方 Go 运行依赖的 TRAE → OpenAI Chat Completions 兼容代理。
+一个轻量、单账号、零第三方 Go 运行依赖的 TRAE → OpenAI Chat Completions / Responses API 兼容代理。
 
-**v0.4.4 是针对真实 Global SG 长连接测试做的稳定性收尾版。** 在 v0.4.3 的模型可用性学习基础上，它修复了 `progress_notice` 等辅助 SSE 事件可能中断输出的问题，把模型状态持久化到 `data/model-status.json`，增加 reasoning 输出兼容模式，并让启动日志与 `/status` 显示真实会话上游，而不是旧配置占位值。
+**v0.5.0 把代理从 Chat Completions 兼容层推进到 Responses / Codex 兼容层。** 在保留 v0.4.4 Global OAuth、自动续期、模型能力学习和稳定 SSE 的基础上，新增 `POST /v1/responses`、Responses 流式事件、function/custom/namespace tool bridge，以及 Codex 当前使用的 client-executed `tool_search` 路径。
 
 > 如果你使用的是 TRAE Global IDE，通常只需要保持 `TRAE_OAUTH_PLATFORM=global`，不要再手工指定旧的 `trae.cn`、SOLO client id 或 v0.4.0 登录 URL。
 
-## ✨ v0.4.4 重点
+## ✨ v0.5.0 重点
+
+- **Responses API**：新增 `POST /v1/responses`，支持非流式与 SSE 流式输出、`instructions`、text input、usage、reasoning、function call 及 tool result 多轮回传。
+- **Codex provider**：支持当前 Codex custom model provider 的 `wire_api = "responses"` HTTP 路径；建议配置 `supports_websockets = false`。
+- **Codex custom/freeform tools**：`custom` 工具（例如 `apply_patch`）会在代理内部桥接成 TRAE function tool，模型调用后再还原为 `custom_tool_call`。
+- **Namespace tools**：Responses `namespace` 下的 function/custom 工具会安全扁平化给 TRAE，并在返回时恢复 namespace，便于 Codex/MCP 的客户端调度。
+- **Client-executed tool_search**：支持 Codex 当前用于延迟发现 MCP/插件工具的 `tool_search` → `tool_search_call` → `tool_search_output` 流程；搜索结果里的延迟加载工具会在下一轮重新注入 TRAE。
+- **Responses 流事件**：输出 `response.created`、`response.in_progress`、`response.output_item.*`、`response.output_text.*`、function/custom tool delta/done 以及 `response.completed` / `response.failed`。
+- **明确的托管工具边界**：`type: mcp`、`web_search`、`file_search`、`code_interpreter` 等需要服务端执行环境的 hosted tools 会返回清晰的 400，而不是伪装支持；Codex/Agent 客户端本地执行的 MCP/function/custom tools 则走上述桥接。
 
 - **SSE 辅助事件容错**：`progress_notice`、heartbeat、未来未知事件即使携带 string/null/非 JSON 数据，也不会再把正常聊天流打断；只有真正需要对象结构的核心事件才严格解析。
 - **模型状态跨重启持久化**：`usable` / `unavailable` 学习结果默认原子写入 `data/model-status.json`，重启后继续使用，过期条目自动回到 `unknown`。
@@ -35,7 +43,7 @@
 - **401/403 自愈**：OAuth 会话真实请求遇到鉴权失败时，强制刷新一次并仅重试原请求一次。
 - **兼容 v0.4.0**：旧 refreshToken/userJwt callback 与 v1 凭证文件仍可迁移；旧 CN/SOLO 凭证会按原产品推断。
 - **兼容静态 Token**：`TRAE_IDE_TOKEN` 仍可作为静态模式或 `auto` fallback。
-- **OpenAI 兼容**：模型列表、流式/非流式 Chat Completions、reasoning、usage、tools / tool_choice / tool_calls。
+- **OpenAI 兼容**：模型列表、Chat Completions、Responses、reasoning、usage，以及 function/custom/namespace/client tool-search 调用链。
 
 > 项目仍保持“轻量单账号代理”的定位；多账号池、账号运营后台、签到/额度管理不在当前范围内。
 
@@ -269,6 +277,7 @@ TRAE_MACHINE_ID=
 | `GET` | `/v1/models/status` | 当前账号模型能力状态与最近错误 |
 | `DELETE` | `/v1/models/status` | 清除当前账号模型状态；可传 `?model=` |
 | `POST` | `/v1/chat/completions` | OpenAI-compatible Chat Completions |
+| `POST` | `/v1/responses` | OpenAI Responses-compatible create endpoint；Codex 推荐使用 |
 
 ### 模型列表与可用性
 
@@ -302,7 +311,7 @@ curl -X DELETE 'http://127.0.0.1:8000/v1/models/status?model=DeepSeek-V4-Flash' 
   -H 'Authorization: Bearer my-local-proxy-key'
 ```
 
-> v0.4.4 仍不会在启动时逐模型主动探测，因此不会为了“验证列表”自动消耗额度。`unknown` 只有在真实请求成功/明确失败后才会变成 `usable` / `unavailable`；学习结果会持久化到本地状态文件并受 TTL 控制。
+> v0.5.0 仍不会在启动时逐模型主动探测，因此不会为了“验证列表”自动消耗额度。`unknown` 只有在真实请求成功/明确失败后才会变成 `usable` / `unavailable`；学习结果会持久化到本地状态文件并受 TTL 控制。
 
 ### Reasoning 输出兼容
 
@@ -381,6 +390,103 @@ OpenAI 风格的 `tools` / `tool_choice` 会转换为 SOLO 所需结构；上游
 - 指定 function 对象
 - assistant 历史中的 `tool_calls`
 - `role=tool` 的工具结果回传
+
+## 🧠 Responses API / Codex
+
+### 最小非流式 Responses
+
+```bash
+curl http://127.0.0.1:8000/v1/responses \
+  -H 'Authorization: Bearer my-local-proxy-key' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "gpt-5.4",
+    "input": "Reply with exactly: OK",
+    "store": false,
+    "stream": false
+  }'
+```
+
+### Responses 流式
+
+```bash
+curl -N http://127.0.0.1:8000/v1/responses \
+  -H 'Authorization: Bearer my-local-proxy-key' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "gpt-5.4",
+    "input": "Hello",
+    "store": false,
+    "stream": true
+  }'
+```
+
+Responses 流不会发送 Chat Completions 的 `data: [DONE]`，而是以 `response.completed` 或 `response.failed` 结束。
+
+### Function / Custom / Namespace
+
+Responses 的 flat function tool 会转换为 TRAE function calling：
+
+```json
+{
+  "type": "function",
+  "name": "read_file",
+  "description": "Read a file",
+  "parameters": {
+    "type": "object",
+    "properties": {"path": {"type": "string"}},
+    "required": ["path"]
+  }
+}
+```
+
+`type: "custom"` 的 freeform input（Codex 的 `apply_patch` 属于这类）会在内部包装成 `{ "input": "..." }` 的函数参数，返回客户端时恢复为标准 `custom_tool_call`；`namespace` 工具会在内部使用 `namespace__tool` 名称，输出时恢复 namespace 字段。
+
+### Codex CLI / TUI custom provider
+
+当前 Codex custom provider 使用 Responses wire API。推荐把本地代理 key 放在环境变量，不写死到配置文件：
+
+```bash
+export TRAE_PROXY_API_KEY='my-local-proxy-key'
+```
+
+`~/.codex/config.toml`：
+
+```toml
+model_provider = "trae_proxy"
+model = "gpt-5.4"
+
+[model_providers.trae_proxy]
+name = "TRAE Proxy"
+base_url = "http://127.0.0.1:8000/v1"
+env_key = "TRAE_PROXY_API_KEY"
+wire_api = "responses"
+requires_openai_auth = false
+supports_websockets = false
+supports_standalone_web_search = false
+```
+
+然后可先做最小验证：
+
+```bash
+codex exec --skip-git-repo-check "Reply with exactly: CODEX_OK"
+```
+
+Codex 的 shell / apply_patch / 普通 function 工具由 Codex 客户端本地执行，代理负责把模型 tool call 往返转换。对于大量 MCP/Plugin 工具，v0.5.0 也支持 Codex 的 client-executed `tool_search`：代理只负责让模型发起搜索调用并接收 Codex 返回的工具定义，MCP 网络连接与工具真正执行仍由 Codex 负责。
+
+当前 Codex CLI/TUI 的 custom provider 路径最适合作为首选验收环境。Codex Desktop 也读取同一套 provider 配置体系，但当前桌面端对 custom provider 的模型选择/既有会话存在上游客户端限制，因此本项目不把 Desktop 宣称为已完整兼容；应以你所使用的 Codex Desktop 版本实测为准。
+
+### 当前 Responses 边界
+
+v0.5.0 是**无状态 text + client-owned tools** 的 Responses 兼容实现。当前支持 `input` string / text message items、`instructions`、function/custom/namespace、client `tool_search`、tool outputs、reasoning 与 usage；以下能力仍未做服务端实现：
+
+- `store=true`、`previous_response_id`、conversation persistence、background response；
+- image/file/audio input、Realtime/WebSocket Responses；
+- Structured Outputs `json_schema`；
+- hosted `mcp` / web search / file search / code interpreter / computer use；
+- Responses retrieve/delete/cancel/compact 等持久化资源接口。
+
+如果 Agent/Codex 把 MCP、Skills、Plugins 转换为本地 function/custom/namespace/tool_search 并由客户端执行，可以使用本代理；如果请求直接要求代理执行 `type: "mcp"` 等 hosted tool，则会明确返回不支持。
 
 ## 🗺️ 模型映射
 
@@ -484,7 +590,28 @@ make check
 - reasoning `preserve` / `merge` / `drop` 转换
 - SOLO → legacy 自动回退
 - 动态模型列表、账号隔离缓存、模型能力状态学习与状态文件重载
+- Responses 非流式 / 流式文本、usage 与 reasoning 事件映射
+- Responses function/custom/namespace tool round-trip
+- Codex 风格 `tool_search` / `tool_search_output` 与延迟 namespace 工具加载
+- Codex 当前 request envelope 中的 `store=false`、reasoning、include、service tier、prompt cache 等兼容字段
 - 本地 `AUTH_TOKEN` 与上游凭证隔离
+
+## ⬆️ 从 v0.4.4 升级到 v0.5.0
+
+不需要重新登录 TRAE，也不需要修改现有 `data/trae-auth.json` 或 `data/model-status.json`。保留原 `.env` 和 `data/` 后更新代码即可。原 `/v1/chat/completions` 行为保持兼容；新增 `/v1/responses` 是并行协议入口。
+
+如果要接 Codex，新增的是 Codex 自己的 provider 配置，不是 TRAE OAuth 配置。Codex 必须使用 `wire_api = "responses"`，并建议 `supports_websockets = false`；本代理当前只实现 HTTP Responses stream。
+
+快速验收：
+
+```bash
+curl -N http://127.0.0.1:8000/v1/responses \
+  -H 'Authorization: Bearer your-api-key' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-5.4","input":"Reply OK","stream":true,"store":false}'
+```
+
+正常应依次看到 `response.created` / `response.in_progress`、文本或 tool 事件以及最终 `response.completed`。
 
 ## ⬆️ 从 v0.4.3 升级到 v0.4.4
 
@@ -599,7 +726,8 @@ TRAE_OAUTH_PLATFORM=global
 
 ## ⚠️ 兼容边界
 
-- 当前专注 Chat Completions，不实现 embeddings、images、audio、OpenAI Responses API 或多账号池。
+- 当前同时支持 Chat Completions 与无状态 HTTP Responses create；不实现 embeddings、images、audio、Realtime/WebSocket、Responses 持久化资源或多账号池。
+- `type: "mcp"` / web search / file search / code interpreter 等 hosted tools 仍需要真正的服务端执行 runtime；v0.5.0 只支持由 Codex/Agent 客户端执行的 function/custom/namespace/tool_search 路径。
 - access token 可以自动刷新，但 refresh token 自身仍可能过期、被撤销或因账号状态变化失效；此时需要重新访问 `/auth/login`。
 - TRAE 登录/Agent 上游并非公开稳定 API。当前版本已把区域、产品、LoginGuidance、Client ID、路径、客户端版本和模型能力状态尽可能动态化/可配置，但后续仍可能随 IDE 更新调整。
 
@@ -614,7 +742,7 @@ TRAE Global and TRAE SOLO share the `/api/agent/v3/llm_utils_chat` endpoint but 
 
 For Global accounts, the default core endpoint is now `https://coresg-normal.trae.ai` for SG and `https://coreva-normal.trae.ai` for US. Existing v0.4.1 managed credentials that contain the generated `trae-api-sg.mchost.guru` or `trae-api-us.mchost.guru` values are migrated automatically on startup; custom `TRAE_API_BASE_URL` overrides are preserved.
 
-After upgrading from v0.4.1, a new browser login is not required. Restart the proxy and retry `/v1/models` and `/v1/chat/completions`.
+After upgrading from v0.4.1, a new browser login is not required. Restart the proxy and retry `/v1/models`, `/v1/chat/completions`, or v0.5.0 `/v1/responses`.
 
 ## v0.4.3 Model availability learning
 

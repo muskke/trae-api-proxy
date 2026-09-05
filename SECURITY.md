@@ -17,7 +17,14 @@
 - The current TRAE callback is served on local `/authorize` (default `127.0.0.1:18080`); the legacy state callback remains only for compatibility.
 - If binding the API to `0.0.0.0`, configure a strong `AUTH_TOKEN` and use an appropriate firewall/reverse proxy.
 - Docker Compose publishes the service only on host `127.0.0.1` by default.
-- `AUTH_TOKEN` protects client API/lifecycle endpoints but is separate from TRAE access/refresh credentials.
+- `AUTH_TOKEN` protects client API/lifecycle endpoints, including `/v1/chat/completions` and `/v1/responses`, but is separate from TRAE access/refresh credentials.
+- `/v1/responses` is intentionally stateless: the proxy does not persist request input, tool output, reasoning text, or Response objects. Client-executed tool definitions and outputs only exist for the lifetime of the request.
+
+## Tool execution boundary
+
+- Function/custom/namespace and client-executed `tool_search` calls are protocol bridges only; the proxy does not execute client tools itself. Apply filesystem/shell/MCP permissions in the Codex/Agent runtime that owns those tools.
+- Hosted Responses tools such as direct `type: mcp`, web search, file search, code interpreter, and computer use are rejected rather than forwarded to an unknown runtime.
+- Avoid exposing the proxy to untrusted clients with a shared `AUTH_TOKEN`: tool schemas and tool outputs can contain sensitive project data even though the proxy does not persist them.
 
 ## Credential lifecycle
 
