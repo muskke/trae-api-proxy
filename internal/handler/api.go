@@ -85,7 +85,7 @@ func (h *APIHandler) HandleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
-	loginURL, err := h.Auth.StartLogin()
+	loginURL, err := h.Auth.StartLogin(r.Context())
 	if err != nil {
 		writeOpenAIError(w, http.StatusInternalServerError, "login_start_failed", err.Error())
 		return
@@ -267,11 +267,13 @@ func (h *APIHandler) authorizeUpstream(r *http.Request, w http.ResponseWriter) (
 		return trae.Session{}, false
 	}
 	return trae.Session{
-		Token:     session.Token,
-		UID:       session.UID,
-		MachineID: session.MachineID,
-		DeviceID:  session.DeviceID,
-		Source:    session.Source,
+		Token:      session.Token,
+		UID:        session.UID,
+		MachineID:  session.MachineID,
+		DeviceID:   session.DeviceID,
+		APIBaseURL: session.APIBaseURL,
+		Platform:   session.Platform,
+		Source:     session.Source,
 	}, true
 }
 

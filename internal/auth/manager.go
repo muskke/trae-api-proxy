@@ -3,9 +3,15 @@ package auth
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -23,7 +29,7 @@ import (
 
 var ErrReauthRequired = errors.New("TRAE login required")
 
-const credentialVersion = 1
+const credentialVersion = 2
 
 type Account struct {
 	UID          string `json:"uid,omitempty"`
@@ -38,6 +44,11 @@ type TokenData struct {
 	RefreshExpiresAt int64  `json:"refreshExpiresAt,omitempty"`
 	Domain           string `json:"domain,omitempty"`
 	APIHost          string `json:"apiHost,omitempty"`
+	APIBaseURL       string `json:"apiBaseUrl,omitempty"`
+	LoginHost        string `json:"loginHost,omitempty"`
+	LoginRegion      string `json:"loginRegion,omitempty"`
+	Platform         string `json:"platform,omitempty"`
+	ClientID         string `json:"clientId,omitempty"`
 	MachineID        string `json:"machineId,omitempty"`
 	DeviceID         string `json:"deviceId,omitempty"`
 }
@@ -49,16 +60,20 @@ type Credential struct {
 }
 
 type Session struct {
-	Token     string
-	UID       string
-	MachineID string
-	DeviceID  string
-	Source    string
+	Token      string
+	UID        string
+	MachineID  string
+	DeviceID   string
+	APIBaseURL string
+	Platform   string
+	Source     string
 }
 
 type Status struct {
 	Mode             string `json:"mode"`
 	Source           string `json:"source"`
+	Platform         string `json:"platform,omitempty"`
+	LoginRegion      string `json:"login_region,omitempty"`
 	Authenticated    bool   `json:"authenticated"`
 	Refreshable      bool   `json:"refreshable"`
 	AutoRefresh      bool   `json:"auto_refresh"`
@@ -73,15 +88,28 @@ type Status struct {
 }
 
 type pendingLogin struct {
-	MachineID string
-	DeviceID  string
-	TraceID   string
-	CreatedAt time.Time
+	Platform      string
+	ClientID      string
+	MachineID     string
+	DeviceID      string
+	TraceID       string
+	LoginHost     string
+	CodeVerifier  string
+	AppVersion    string
+	PluginVersion string
+	DeviceBrand   string
+	DeviceType    string
+	OSVersion     string
+	CreatedAt     time.Time
 }
 
 type callbackInfo struct {
 	RefreshToken string
 	AccessToken  string
+	AuthCode     string
+	LoginHost    string
+	LoginRegion  string
+	UserTag      string
 	UID          string
 	Nickname     string
 	EnterpriseID string
@@ -93,6 +121,7 @@ type exchangeResult struct {
 	RefreshToken     string
 	ExpiresAt        int64
 	RefreshExpiresAt int64
+	APIHost          string
 }
 
 type userInfo struct {
@@ -189,21 +218,25 @@ func (m *Manager) oauthSession(ctx context.Context) (Session, error) {
 
 func (m *Manager) staticSession() Session {
 	return Session{
-		Token:     m.cfg.IdeToken,
-		UID:       m.cfg.UID,
-		MachineID: m.cfg.MachineID,
-		DeviceID:  m.cfg.DeviceID,
-		Source:    "token",
+		Token:      m.cfg.IdeToken,
+		UID:        m.cfg.UID,
+		MachineID:  m.cfg.MachineID,
+		DeviceID:   m.cfg.DeviceID,
+		APIBaseURL: m.cfg.APIBaseURL,
+		Platform:   m.cfg.OAuthPlatform,
+		Source:     "token",
 	}
 }
 
 func (m *Manager) passthroughSession(token string) Session {
 	return Session{
-		Token:     token,
-		UID:       m.cfg.UID,
-		MachineID: m.cfg.MachineID,
-		DeviceID:  m.cfg.DeviceID,
-		Source:    "passthrough",
+		Token:      token,
+		UID:        m.cfg.UID,
+		MachineID:  m.cfg.MachineID,
+		DeviceID:   m.cfg.DeviceID,
+		APIBaseURL: m.cfg.APIBaseURL,
+		Platform:   m.cfg.OAuthPlatform,
+		Source:     "passthrough",
 	}
 }
 
@@ -214,11 +247,13 @@ func (m *Manager) oauthSnapshot() Session {
 		return Session{Source: "oauth"}
 	}
 	return Session{
-		Token:     m.credential.Auth.AccessToken,
-		UID:       m.credential.Account.UID,
-		MachineID: m.credential.Auth.MachineID,
-		DeviceID:  m.credential.Auth.DeviceID,
-		Source:    "oauth",
+		Token:      m.credential.Auth.AccessToken,
+		UID:        m.credential.Account.UID,
+		MachineID:  m.credential.Auth.MachineID,
+		DeviceID:   m.credential.Auth.DeviceID,
+		APIBaseURL: firstNonEmpty(m.credential.Auth.APIBaseURL, m.cfg.APIBaseURL),
+		Platform:   firstNonEmpty(m.credential.Auth.Platform, m.cfg.OAuthPlatform),
+		Source:     "oauth",
 	}
 }
 
@@ -272,7 +307,7 @@ func (m *Manager) refresh(ctx context.Context, force bool) (bool, error) {
 		return false, nil
 	}
 
-	result, err := m.exchange(ctx, cred.Auth.APIHost, cred.Auth.RefreshToken)
+	result, err := m.exchangeRefresh(ctx, cred.Auth, cred.Auth.RefreshToken)
 	if err != nil {
 		m.setLastError(err.Error())
 		return false, err
@@ -287,8 +322,20 @@ func (m *Manager) refresh(ctx context.Context, force bool) (bool, error) {
 	if result.RefreshExpiresAt > 0 {
 		cred.Auth.RefreshExpiresAt = result.RefreshExpiresAt
 	}
+	if result.APIHost != "" {
+		cred.Auth.APIHost = result.APIHost
+	}
 	if cred.Auth.APIHost == "" {
 		cred.Auth.APIHost = m.cfg.OAuthHost
+	}
+	if cred.Auth.Platform == "" {
+		cred.Auth.Platform = m.cfg.OAuthPlatform
+	}
+	if cred.Auth.ClientID == "" {
+		cred.Auth.ClientID = m.cfg.OAuthClientID
+	}
+	if cred.Auth.APIBaseURL == "" {
+		cred.Auth.APIBaseURL = apiBaseURLForRegion(cred.Auth.LoginRegion, cred.Auth.Platform, m.cfg.APIBaseURL)
 	}
 	if cred.Version == 0 {
 		cred.Version = credentialVersion
@@ -362,6 +409,8 @@ func (m *Manager) Status() Status {
 	}
 	if m.credential != nil && (m.credential.Auth.AccessToken != "" || m.credential.Auth.RefreshToken != "") {
 		st.Source = "oauth"
+		st.Platform = firstNonEmpty(m.credential.Auth.Platform, m.cfg.OAuthPlatform)
+		st.LoginRegion = m.credential.Auth.LoginRegion
 		st.Authenticated = m.credential.Auth.AccessToken != "" && (m.credential.Auth.ExpiresAt <= 0 || m.now().Unix() < m.credential.Auth.ExpiresAt)
 		st.Refreshable = m.credential.Auth.RefreshToken != "" && (m.credential.Auth.RefreshExpiresAt <= 0 || m.now().Unix() < m.credential.Auth.RefreshExpiresAt)
 		st.AutoRefresh = st.Refreshable
@@ -384,29 +433,101 @@ func (m *Manager) Status() Status {
 	return st
 }
 
-func (m *Manager) StartLogin() (string, error) {
+func (m *Manager) StartLogin(ctx context.Context) (string, error) {
 	state, err := randomHex(16)
 	if err != nil {
 		return "", err
 	}
-	machineID, err := randomHex(16)
+	machineID := strings.TrimSpace(m.cfg.MachineID)
+	if machineID == "" {
+		machineID, err = randomUUID()
+		if err != nil {
+			return "", err
+		}
+	}
+	deviceID := loginDeviceID(m.cfg.DeviceID)
+	traceID, err := randomUUID()
 	if err != nil {
 		return "", err
 	}
-	deviceID, err := randomHex(16)
+	codeVerifier, codeChallenge, err := generatePKCE()
 	if err != nil {
 		return "", err
 	}
-	traceID := machineTraceID(machineID, deviceID)
-	callbackURL := strings.TrimRight(m.cfg.OAuthCallbackBase, "/") + "/auth/callback/" + state
+	loginHost, err := m.requestLoginGuidance(ctx, traceID)
+	if err != nil {
+		return "", err
+	}
+	callbackURL := strings.TrimRight(m.cfg.OAuthCallbackBase, "/") + "/authorize"
+	loginURL, err := m.buildVerificationURL(loginHost, traceID, callbackURL, machineID, deviceID, codeChallenge)
+	if err != nil {
+		return "", err
+	}
 
-	loginURL, err := url.Parse(m.cfg.OAuthConsoleURL)
-	if err != nil {
-		return "", err
+	m.loginMu.Lock()
+	m.prunePendingLocked()
+	m.pending[state] = pendingLogin{
+		Platform:      m.cfg.OAuthPlatform,
+		ClientID:      m.cfg.OAuthClientID,
+		MachineID:     machineID,
+		DeviceID:      deviceID,
+		TraceID:       traceID,
+		LoginHost:     loginHost,
+		CodeVerifier:  codeVerifier,
+		AppVersion:    m.cfg.IDEVersion,
+		PluginVersion: m.cfg.OAuthPluginVersion,
+		DeviceBrand:   m.cfg.DeviceBrand,
+		DeviceType:    m.cfg.DeviceType,
+		OSVersion:     m.cfg.OSVersion,
+		CreatedAt:     m.now(),
 	}
+	m.loginMu.Unlock()
+	return loginURL, nil
+}
+
+func (m *Manager) requestLoginGuidance(ctx context.Context, traceID string) (string, error) {
+	body := map[string]any{"loginTraceID": traceID, "login_trace_id": traceID}
+	var failures []string
+	for _, endpoint := range m.cfg.OAuthGuidanceURLs {
+		var response map[string]any
+		if err := m.postOAuthJSON(ctx, endpoint, body, "", &response); err != nil {
+			failures = append(failures, endpoint+": "+err.Error())
+			continue
+		}
+		if host := findStringByKeys(response, "LoginHost", "loginHost", "LoginURL", "loginUrl"); host != "" {
+			return host, nil
+		}
+		failures = append(failures, endpoint+": response missing LoginHost")
+	}
+	if m.cfg.OAuthIsCN() {
+		u, err := url.Parse(m.cfg.OAuthConsoleURL)
+		if err == nil && u.Scheme != "" && u.Host != "" {
+			return u.Scheme + "://" + u.Host, nil
+		}
+	}
+	return "", fmt.Errorf("TRAE LoginGuidance failed for %s: %s", m.cfg.OAuthPlatform, strings.Join(failures, " | "))
+}
+
+func (m *Manager) buildVerificationURL(loginHost, traceID, callbackURL, machineID, deviceID, codeChallenge string) (string, error) {
+	loginHost = strings.TrimSpace(loginHost)
+	if !strings.Contains(loginHost, "://") {
+		loginHost = "https://" + loginHost
+	}
+	loginURL, err := url.Parse(loginHost)
+	if err != nil || loginURL.Host == "" {
+		return "", fmt.Errorf("invalid LoginGuidance host %q", loginHost)
+	}
+	loginURL.Path = "/authorization"
+	loginURL.RawQuery = ""
+	loginURL.Fragment = ""
 	q := loginURL.Query()
 	q.Set("login_version", "1")
-	q.Set("auth_from", "solo")
+	if m.cfg.OAuthIsSolo() {
+		q.Set("auth_from", "solo")
+		q.Set("hide_saas_login", "true")
+	} else {
+		q.Set("auth_from", "trae")
+	}
 	q.Set("login_channel", "native_ide")
 	q.Set("plugin_version", m.cfg.OAuthPluginVersion)
 	q.Set("auth_type", "local")
@@ -418,31 +539,24 @@ func (m *Manager) StartLogin() (string, error) {
 	q.Set("device_id", deviceID)
 	q.Set("x_device_id", deviceID)
 	q.Set("x_machine_id", machineID)
-	q.Set("x_device_brand", "PC")
-	q.Set("x_device_type", "PC")
-	q.Set("x_os_version", "1.0")
+	q.Set("x_device_brand", m.cfg.DeviceBrand)
+	q.Set("x_device_type", m.cfg.DeviceType)
+	q.Set("x_os_version", m.cfg.OSVersion)
+	q.Set("x_env", "")
 	q.Set("x_app_version", m.cfg.IDEVersion)
 	q.Set("x_app_type", m.cfg.IDEVersionType)
+	q.Set("code_challenge", codeChallenge)
+	q.Set("code_challenge_method", "S256")
 	loginURL.RawQuery = q.Encode()
-
-	m.loginMu.Lock()
-	m.prunePendingLocked()
-	m.pending[state] = pendingLogin{
-		MachineID: machineID,
-		DeviceID:  deviceID,
-		TraceID:   traceID,
-		CreatedAt: m.now(),
-	}
-	m.loginMu.Unlock()
 	return loginURL.String(), nil
 }
 
 func (m *Manager) CompleteLogin(ctx context.Context, state string, query url.Values) (Status, error) {
-	pending, err := m.consumePending(state)
+	pending, err := m.consumePendingForCallback(state, query)
 	if err != nil {
 		return Status{}, err
 	}
-	if got := strings.TrimSpace(query.Get("loginTraceID")); got != "" && !strings.EqualFold(got, pending.TraceID) {
+	if got := firstNonEmpty(query.Get("loginTraceID"), query.Get("login_trace_id")); got != "" && !strings.EqualFold(got, pending.TraceID) {
 		return Status{}, fmt.Errorf("login callback trace mismatch")
 	}
 
@@ -450,6 +564,13 @@ func (m *Manager) CompleteLogin(ctx context.Context, state string, query url.Val
 	if err != nil {
 		return Status{}, err
 	}
+	if info.LoginHost == "" {
+		info.LoginHost = pending.LoginHost
+	}
+	if info.LoginRegion == "" {
+		info.LoginRegion = inferLoginRegion(info.LoginHost, pending.Platform)
+	}
+
 	cred := Credential{
 		Version: credentialVersion,
 		Account: Account{
@@ -461,31 +582,39 @@ func (m *Manager) CompleteLogin(ctx context.Context, state string, query url.Val
 			AccessToken:  info.AccessToken,
 			RefreshToken: info.RefreshToken,
 			ExpiresAt:    info.ExpiresAt,
-			Domain:       "trae.cn",
-			APIHost:      m.cfg.OAuthHost,
+			Domain:       domainForPlatform(pending.Platform),
+			LoginHost:    info.LoginHost,
+			LoginRegion:  info.LoginRegion,
+			Platform:     pending.Platform,
+			ClientID:     pending.ClientID,
 			MachineID:    pending.MachineID,
 			DeviceID:     pending.DeviceID,
+			APIBaseURL:   apiBaseURLForRegion(info.LoginRegion, pending.Platform, m.cfg.APIBaseURL),
 		},
 	}
 
-	if cred.Auth.RefreshToken != "" {
-		result, exErr := m.exchange(ctx, cred.Auth.APIHost, cred.Auth.RefreshToken)
+	if info.AuthCode != "" {
+		result, exErr := m.exchangeAuthCode(ctx, pending, info.AuthCode, info.UserTag)
 		if exErr != nil {
 			return Status{}, exErr
 		}
-		cred.Auth.AccessToken = result.AccessToken
-		if result.RefreshToken != "" {
-			cred.Auth.RefreshToken = result.RefreshToken
+		applyExchangeResult(&cred.Auth, result)
+	} else if cred.Auth.RefreshToken != "" {
+		result, exErr := m.exchangeRefresh(ctx, cred.Auth, cred.Auth.RefreshToken)
+		if exErr != nil {
+			return Status{}, exErr
 		}
-		cred.Auth.ExpiresAt = result.ExpiresAt
-		cred.Auth.RefreshExpiresAt = result.RefreshExpiresAt
+		applyExchangeResult(&cred.Auth, result)
 	}
 	if cred.Auth.AccessToken == "" {
 		return Status{}, fmt.Errorf("login callback did not provide a usable access token")
 	}
 
-	ui, infoErr := m.getUserInfo(ctx, cred.Auth.APIHost, cred.Auth.AccessToken)
+	ui, userInfoHost, infoErr := m.getUserInfo(ctx, cred.Auth, cred.Auth.AccessToken)
 	if infoErr == nil {
+		if userInfoHost != "" {
+			cred.Auth.APIHost = userInfoHost
+		}
 		if ui.UID != "" {
 			cred.Account.UID = ui.UID
 		}
@@ -496,11 +625,11 @@ func (m *Manager) CompleteLogin(ctx context.Context, state string, query url.Val
 			cred.Account.EnterpriseID = ui.EnterpriseID
 		}
 	}
-	if cred.Account.UID == "" {
-		if infoErr != nil {
-			return Status{}, fmt.Errorf("cannot determine TRAE UID: %w", infoErr)
-		}
-		return Status{}, fmt.Errorf("cannot determine TRAE UID")
+	if cred.Account.UID == "" && infoErr != nil {
+		// Some current Global callbacks do not expose UserID, while the access token
+		// is still completely usable. Keep the session rather than throwing away a
+		// successful authorization; /auth/status will simply omit UID.
+		m.setLastError("GetUserInfo after login: " + infoErr.Error())
 	}
 	if err := saveCredential(m.cfg.AuthFile, &cred); err != nil {
 		return Status{}, fmt.Errorf("save credential: %w", err)
@@ -509,9 +638,75 @@ func (m *Manager) CompleteLogin(ctx context.Context, state string, query url.Val
 	m.mu.Lock()
 	m.credential = &cred
 	m.lastRefreshAt = m.now()
-	m.lastError = ""
+	if infoErr == nil {
+		m.lastError = ""
+	}
 	m.mu.Unlock()
 	return m.Status(), nil
+}
+
+func (m *Manager) exchangeAuthCode(ctx context.Context, pending pendingLogin, authCode, userTag string) (exchangeResult, error) {
+	publicKey, err := generateDevicePublicKey()
+	if err != nil {
+		return exchangeResult{}, err
+	}
+	platformCode := "IDE_PC"
+	if strings.HasSuffix(pending.Platform, "solo") {
+		platformCode = "SOLO_PC"
+	}
+	deviceName := firstNonEmpty(os.Getenv("USERNAME"), os.Getenv("USER"), os.Getenv("HOSTNAME"), "PC")
+	body := map[string]any{
+		"ClientID":     pending.ClientID,
+		"AuthCode":     authCode,
+		"CodeVerifier": pending.CodeVerifier,
+		"IDEVersion":   pending.AppVersion,
+		"DeviceInfo": map[string]any{
+			"DeviceID":        pending.DeviceID,
+			"MachineID":       pending.MachineID,
+			"PlatformCode":    platformCode,
+			"DeviceType":      "PC",
+			"DeviceName":      deviceName,
+			"DeviceModel":     pending.DeviceBrand,
+			"ClientVersion":   pending.AppVersion,
+			"DevicePublicKey": publicKey,
+			"DeviceBrand":     deviceBrandForType(pending.DeviceType, pending.DeviceBrand),
+			"DeviceCPU":       "",
+			"OSInfo":          pending.DeviceType,
+			"OSVersion":       pending.OSVersion,
+		},
+	}
+	var failures []string
+	for _, host := range m.authCodeAPIHosts(pending.Platform, userTag) {
+		var response map[string]any
+		endpoint := strings.TrimRight(host, "/") + m.cfg.OAuthAuthCodeExchangePath
+		if err := m.postOAuthJSON(ctx, endpoint, body, "", &response); err != nil {
+			failures = append(failures, host+": "+err.Error())
+			continue
+		}
+		result := parseExchangeResult(response, m.now())
+		if result.AccessToken == "" {
+			failures = append(failures, host+": response missing access token")
+			continue
+		}
+		result.APIHost = host
+		return result, nil
+	}
+	return exchangeResult{}, fmt.Errorf("TRAE AuthCode ExchangeToken failed: %s", strings.Join(failures, " | "))
+}
+
+func (m *Manager) authCodeAPIHosts(platform, userTag string) []string {
+	var hosts []string
+	if isCustomOAuthHost(m.cfg.OAuthHost, platform) {
+		hosts = append(hosts, m.cfg.OAuthHost)
+	}
+	if strings.HasPrefix(platform, "cn") {
+		hosts = append(hosts, "https://api.trae.cn", "https://api.trae.com.cn")
+	} else if strings.EqualFold(strings.TrimSpace(userTag), "usttp") || strings.EqualFold(strings.TrimSpace(userTag), "us_ttp") || strings.EqualFold(strings.TrimSpace(userTag), "us-ttp") {
+		hosts = append(hosts, "https://grow-normal.traeapi.us")
+	} else {
+		hosts = append(hosts, "https://growsg-normal.trae.ai", "https://grow-normal.trae.ai")
+	}
+	return dedupeStrings(hosts)
 }
 
 func (m *Manager) Logout() error {
@@ -540,6 +735,34 @@ func (m *Manager) consumePending(state string) (pendingLogin, error) {
 	return p, nil
 }
 
+func (m *Manager) consumePendingForCallback(state string, query url.Values) (pendingLogin, error) {
+	if strings.TrimSpace(state) != "" {
+		return m.consumePending(state)
+	}
+	m.loginMu.Lock()
+	defer m.loginMu.Unlock()
+	m.prunePendingLocked()
+	traceID := firstNonEmpty(query.Get("loginTraceID"), query.Get("login_trace_id"))
+	var foundKey string
+	var found pendingLogin
+	for key, candidate := range m.pending {
+		if traceID != "" && strings.EqualFold(traceID, candidate.TraceID) {
+			foundKey, found = key, candidate
+			break
+		}
+	}
+	if foundKey == "" && traceID == "" && len(m.pending) == 1 {
+		for key, candidate := range m.pending {
+			foundKey, found = key, candidate
+		}
+	}
+	if foundKey == "" {
+		return pendingLogin{}, fmt.Errorf("login callback does not match an active login session")
+	}
+	delete(m.pending, foundKey)
+	return found, nil
+}
+
 func (m *Manager) prunePendingLocked() {
 	for state, p := range m.pending {
 		if m.now().Sub(p.CreatedAt) > m.cfg.OAuthLoginTTL {
@@ -557,15 +780,45 @@ func (m *Manager) loadCredential() error {
 	if err := json.Unmarshal(raw, &cred); err != nil {
 		return fmt.Errorf("decode %s: %w", m.cfg.AuthFile, err)
 	}
-	if cred.Version == 0 {
-		cred.Version = credentialVersion
-	}
+	oldVersion := cred.Version
 	if cred.Auth.AccessToken == "" && cred.Auth.RefreshToken == "" {
 		return fmt.Errorf("credential contains neither accessToken nor refreshToken")
+	}
+	if cred.Auth.Platform == "" {
+		if strings.Contains(strings.ToLower(cred.Auth.Domain+" "+cred.Auth.APIHost), ".cn") {
+			if oldVersion <= 1 {
+				cred.Auth.Platform = "cn-solo"
+			} else {
+				cred.Auth.Platform = "cn"
+			}
+		} else {
+			cred.Auth.Platform = firstNonEmpty(m.cfg.OAuthPlatform, config.DefaultOAuthPlatform)
+		}
+	}
+	if cred.Auth.ClientID == "" {
+		if strings.HasSuffix(cred.Auth.Platform, "solo") {
+			cred.Auth.ClientID = config.DefaultSoloOAuthClientID
+		} else {
+			cred.Auth.ClientID = m.cfg.OAuthClientID
+		}
 	}
 	if cred.Auth.APIHost == "" {
 		cred.Auth.APIHost = m.cfg.OAuthHost
 	}
+	if cred.Auth.LoginHost == "" {
+		if strings.HasPrefix(cred.Auth.Platform, "cn") {
+			cred.Auth.LoginHost = "https://www.trae.cn"
+		} else {
+			cred.Auth.LoginHost = "https://www.trae.ai"
+		}
+	}
+	if cred.Auth.LoginRegion == "" {
+		cred.Auth.LoginRegion = inferLoginRegion(cred.Auth.LoginHost, cred.Auth.Platform)
+	}
+	if cred.Auth.APIBaseURL == "" {
+		cred.Auth.APIBaseURL = apiBaseURLForRegion(cred.Auth.LoginRegion, cred.Auth.Platform, m.cfg.APIBaseURL)
+	}
+	cred.Version = credentialVersion
 	m.credential = &cred
 	return nil
 }
@@ -614,60 +867,82 @@ func saveCredential(path string, cred *Credential) error {
 	return os.Rename(tmpName, path)
 }
 
-func (m *Manager) exchange(ctx context.Context, apiHost, refreshToken string) (exchangeResult, error) {
-	if apiHost == "" {
-		apiHost = m.cfg.OAuthHost
-	}
+func (m *Manager) exchangeRefresh(ctx context.Context, auth TokenData, refreshToken string) (exchangeResult, error) {
 	body := map[string]any{
-		"ClientID":     m.cfg.OAuthClientID,
+		"ClientID":     firstNonEmpty(auth.ClientID, m.cfg.OAuthClientID),
 		"RefreshToken": refreshToken,
 		"ClientSecret": "-",
 		"UserID":       "",
 	}
-	var envelope struct {
-		Result struct {
-			Token                 string `json:"Token"`
-			RefreshToken          string `json:"RefreshToken"`
-			TokenExpireAt         int64  `json:"TokenExpireAt"`
-			TokenExpireDuration   int64  `json:"TokenExpireDuration"`
-			RefreshExpireAt       int64  `json:"RefreshExpireAt"`
-			RefreshExpireDuration int64  `json:"RefreshExpireDuration"`
-		} `json:"Result"`
+	var failures []string
+	for _, apiHost := range m.oauthAPIHosts(auth) {
+		var response map[string]any
+		endpoint := strings.TrimRight(apiHost, "/") + m.cfg.OAuthExchangePath
+		if err := m.postOAuthJSON(ctx, endpoint, body, auth.AccessToken, &response); err != nil {
+			failures = append(failures, apiHost+": "+err.Error())
+			continue
+		}
+		result := parseExchangeResult(response, m.now())
+		if result.AccessToken == "" {
+			failures = append(failures, apiHost+": response missing Token")
+			continue
+		}
+		result.APIHost = apiHost
+		return result, nil
 	}
-	if err := m.postOAuthJSON(ctx, apiHost+m.cfg.OAuthExchangePath, body, "", &envelope); err != nil {
-		return exchangeResult{}, err
-	}
-	if envelope.Result.Token == "" {
-		return exchangeResult{}, fmt.Errorf("ExchangeToken response did not contain Token; login required")
-	}
-	return exchangeResult{
-		AccessToken:      envelope.Result.Token,
-		RefreshToken:     envelope.Result.RefreshToken,
-		ExpiresAt:        expiryFrom(envelope.Result.TokenExpireAt, envelope.Result.TokenExpireDuration, m.now()),
-		RefreshExpiresAt: expiryFrom(envelope.Result.RefreshExpireAt, envelope.Result.RefreshExpireDuration, m.now()),
-	}, nil
+	return exchangeResult{}, fmt.Errorf("TRAE refresh ExchangeToken failed: %s", strings.Join(failures, " | "))
 }
 
-func (m *Manager) getUserInfo(ctx context.Context, apiHost, accessToken string) (userInfo, error) {
-	if apiHost == "" {
-		apiHost = m.cfg.OAuthHost
-	}
+func (m *Manager) getUserInfo(ctx context.Context, auth TokenData, accessToken string) (userInfo, string, error) {
 	body := map[string]any{"ReqSource": "IDE", "IDEVersion": m.cfg.IDEVersion}
-	var envelope struct {
-		Result struct {
-			UserID       string `json:"UserID"`
-			ScreenName   string `json:"ScreenName"`
-			EnterpriseID string `json:"EnterpriseID"`
-		} `json:"Result"`
+	var failures []string
+	for _, apiHost := range m.oauthAPIHosts(auth) {
+		var response map[string]any
+		endpoint := strings.TrimRight(apiHost, "/") + m.cfg.OAuthUserInfoPath
+		if err := m.postOAuthJSON(ctx, endpoint, body, accessToken, &response); err != nil {
+			failures = append(failures, apiHost+": "+err.Error())
+			continue
+		}
+		ui := userInfo{
+			UID:          firstNonEmpty(nestedString(response, "Result", "UserID"), nestedString(response, "result", "userId"), findStringByKeys(response, "UserID", "userId", "uid")),
+			Nickname:     firstNonEmpty(nestedString(response, "Result", "ScreenName"), nestedString(response, "result", "screenName"), findStringByKeys(response, "ScreenName", "screenName", "nickname")),
+			EnterpriseID: firstNonEmpty(nestedString(response, "Result", "EnterpriseID"), nestedString(response, "result", "enterpriseId"), findStringByKeys(response, "EnterpriseID", "enterpriseId", "TenantID")),
+		}
+		return ui, apiHost, nil
 	}
-	if err := m.postOAuthJSON(ctx, apiHost+m.cfg.OAuthUserInfoPath, body, accessToken, &envelope); err != nil {
-		return userInfo{}, err
+	return userInfo{}, "", fmt.Errorf("TRAE GetUserInfo failed: %s", strings.Join(failures, " | "))
+}
+
+func (m *Manager) oauthAPIHosts(auth TokenData) []string {
+	var hosts []string
+	platform := firstNonEmpty(auth.Platform, m.cfg.OAuthPlatform, config.DefaultOAuthPlatform)
+	if isCustomOAuthHost(m.cfg.OAuthHost, platform) {
+		hosts = append(hosts, auth.APIHost, m.cfg.OAuthHost)
+		return dedupeStrings(hosts)
 	}
-	return userInfo{
-		UID:          envelope.Result.UserID,
-		Nickname:     envelope.Result.ScreenName,
-		EnterpriseID: envelope.Result.EnterpriseID,
-	}, nil
+	if auth.APIHost != "" {
+		hosts = append(hosts, auth.APIHost)
+	}
+	if auth.LoginHost != "" {
+		if origin := urlOrigin(auth.LoginHost); origin != "" {
+			hosts = append(hosts, origin)
+			if u, err := url.Parse(origin); err == nil {
+				host := u.Hostname()
+				if strings.HasPrefix(host, "www.") {
+					hosts = append(hosts, u.Scheme+"://api."+strings.TrimPrefix(host, "www."))
+				}
+			}
+		}
+	}
+	if m.cfg.OAuthHost != "" {
+		hosts = append(hosts, m.cfg.OAuthHost)
+	}
+	if strings.HasPrefix(platform, "cn") {
+		hosts = append(hosts, "https://api.trae.cn", "https://api.trae.com.cn", "https://www.trae.cn")
+	} else {
+		hosts = append(hosts, "https://api.marscode.com", "https://api.trae.ai", "https://www.trae.ai", "https://www.marscode.com")
+	}
+	return dedupeStrings(hosts)
 }
 
 func (m *Manager) postOAuthJSON(ctx context.Context, endpoint string, body any, accessToken string, out any) error {
@@ -706,22 +981,46 @@ func (m *Manager) postOAuthJSON(ctx context.Context, endpoint string, body any, 
 }
 
 func parseCallback(q url.Values) (callbackInfo, error) {
-	info := callbackInfo{RefreshToken: strings.TrimSpace(q.Get("refreshToken"))}
-	userInfoMap := parseJSONParam(q.Get("userInfo"))
-	info.UID = jsonString(userInfoMap, "UserID")
-	info.Nickname = jsonString(userInfoMap, "ScreenName")
-	info.EnterpriseID = jsonString(userInfoMap, "TenantID")
-
-	jwt := parseJSONParam(q.Get("userJwt"))
-	if info.RefreshToken == "" {
-		info.RefreshToken = jsonString(jwt, "RefreshToken")
+	info := callbackInfo{
+		RefreshToken: firstNonEmpty(q.Get("refreshToken"), q.Get("refresh_token"), q.Get("RefreshToken")),
+		AuthCode:     firstNonEmpty(q.Get("authCode"), q.Get("auth_code"), q.Get("AuthCode"), q.Get("authorization_code"), q.Get("code")),
+		LoginHost:    firstNonEmpty(q.Get("loginHost"), q.Get("login_host"), q.Get("LoginHost")),
+		LoginRegion:  strings.ToLower(firstNonEmpty(q.Get("loginRegion"), q.Get("login_region"), q.Get("LoginRegion"))),
+		UserTag:      firstNonEmpty(q.Get("userTag"), q.Get("user_tag"), q.Get("UserTag")),
 	}
-	if info.RefreshToken == "" {
-		info.AccessToken = jsonString(jwt, "Token")
-		info.ExpiresAt = normalizeExpiry(jsonInt64(jwt, "TokenExpireAt"))
-		if info.AccessToken == "" {
-			return callbackInfo{}, fmt.Errorf("login callback missing refreshToken and userJwt.Token")
+	if info.AuthCode == "" {
+		for _, key := range []string{"authCodeInfo", "auth_code_info", "AuthCodeInfo"} {
+			if raw := strings.TrimSpace(q.Get(key)); raw != "" {
+				parsed := parseJSONParam(raw)
+				info.AuthCode = firstNonEmpty(jsonString(parsed, "AuthCode"), jsonString(parsed, "authCode"), jsonString(parsed, "auth_code"), jsonString(parsed, "code"))
+				if expireAt := firstPositive(jsonInt64(parsed, "ExpireAt"), jsonInt64(parsed, "expireAt"), jsonInt64(parsed, "expiresAt")); expireAt > 0 {
+					expires := expireAt
+					if expires < 1e12 {
+						expires *= 1000
+					}
+					if expires <= time.Now().UnixMilli() {
+						return callbackInfo{}, fmt.Errorf("login callback authCodeInfo is expired")
+					}
+				}
+				break
+			}
 		}
+	}
+
+	userInfoMap := parseJSONParam(q.Get("userInfo"))
+	info.UID = firstNonEmpty(jsonString(userInfoMap, "UserID"), jsonString(userInfoMap, "userId"), jsonString(userInfoMap, "uid"))
+	info.Nickname = firstNonEmpty(jsonString(userInfoMap, "ScreenName"), jsonString(userInfoMap, "screenName"), jsonString(userInfoMap, "nickname"))
+	info.EnterpriseID = firstNonEmpty(jsonString(userInfoMap, "TenantID"), jsonString(userInfoMap, "EnterpriseID"), jsonString(userInfoMap, "enterpriseId"))
+
+	jwt := parseJSONParam(firstNonEmpty(q.Get("userJwt"), q.Get("user_jwt")))
+	if info.RefreshToken == "" {
+		info.RefreshToken = firstNonEmpty(jsonString(jwt, "RefreshToken"), jsonString(jwt, "refreshToken"))
+	}
+	info.AccessToken = firstNonEmpty(q.Get("accessToken"), q.Get("access_token"), q.Get("token"), jsonString(jwt, "Token"), jsonString(jwt, "AccessToken"), jsonString(jwt, "accessToken"))
+	info.ExpiresAt = normalizeExpiry(firstPositive(jsonInt64(jwt, "TokenExpireAt"), jsonInt64(jwt, "expiresAt")))
+
+	if info.RefreshToken == "" && info.AuthCode == "" && info.AccessToken == "" {
+		return callbackInfo{}, fmt.Errorf("login callback missing authCodeInfo/AuthCode, refreshToken, and access token")
 	}
 	return info, nil
 }
@@ -755,7 +1054,7 @@ func jsonString(m map[string]any, key string) string {
 	}
 	switch x := v.(type) {
 	case string:
-		return x
+		return strings.TrimSpace(x)
 	case json.Number:
 		return x.String()
 	default:
@@ -771,18 +1070,80 @@ func jsonInt64(m map[string]any, key string) int64 {
 	if !ok || v == nil {
 		return 0
 	}
+	return anyInt64(v)
+}
+
+func anyInt64(v any) int64 {
 	switch x := v.(type) {
 	case json.Number:
 		n, _ := x.Int64()
 		return n
 	case float64:
 		return int64(x)
+	case float32:
+		return int64(x)
+	case int:
+		return int64(x)
+	case int64:
+		return x
 	case string:
 		var n int64
 		_, _ = fmt.Sscan(x, &n)
 		return n
 	default:
 		return 0
+	}
+}
+
+func parseExchangeResult(root map[string]any, now time.Time) exchangeResult {
+	accessToken := firstNonEmpty(
+		nestedString(root, "Result", "Token"), nestedString(root, "Result", "AccessToken"),
+		nestedString(root, "result", "Token"), nestedString(root, "result", "token"), nestedString(root, "result", "accessToken"),
+		nestedString(root, "data", "Token"), nestedString(root, "data", "token"), nestedString(root, "data", "accessToken"),
+		findStringByKeys(root, "Token", "AccessToken", "accessToken", "access_token"),
+	)
+	refreshToken := firstNonEmpty(
+		nestedString(root, "Result", "RefreshToken"), nestedString(root, "result", "RefreshToken"), nestedString(root, "result", "refreshToken"),
+		nestedString(root, "data", "RefreshToken"), nestedString(root, "data", "refreshToken"),
+		findStringByKeys(root, "RefreshToken", "refreshToken", "refresh_token"),
+	)
+	tokenExpireAt := firstPositive(
+		nestedInt64(root, "Result", "TokenExpireAt"), nestedInt64(root, "result", "TokenExpireAt"), nestedInt64(root, "result", "tokenExpireAt"),
+		nestedInt64(root, "data", "TokenExpireAt"), nestedInt64(root, "data", "tokenExpireAt"),
+	)
+	tokenDuration := firstPositive(
+		nestedInt64(root, "Result", "TokenExpireDuration"), nestedInt64(root, "result", "TokenExpireDuration"), nestedInt64(root, "result", "tokenExpireDuration"),
+	)
+	refreshExpireAt := firstPositive(
+		nestedInt64(root, "Result", "RefreshExpireAt"), nestedInt64(root, "result", "RefreshExpireAt"), nestedInt64(root, "result", "refreshExpireAt"),
+		nestedInt64(root, "data", "RefreshExpireAt"), nestedInt64(root, "data", "refreshExpireAt"),
+	)
+	refreshDuration := firstPositive(
+		nestedInt64(root, "Result", "RefreshExpireDuration"), nestedInt64(root, "result", "RefreshExpireDuration"), nestedInt64(root, "result", "refreshExpireDuration"),
+	)
+	return exchangeResult{
+		AccessToken:      accessToken,
+		RefreshToken:     refreshToken,
+		ExpiresAt:        expiryFrom(tokenExpireAt, tokenDuration, now),
+		RefreshExpiresAt: expiryFrom(refreshExpireAt, refreshDuration, now),
+	}
+}
+
+func applyExchangeResult(auth *TokenData, result exchangeResult) {
+	if result.AccessToken != "" {
+		auth.AccessToken = result.AccessToken
+	}
+	if result.RefreshToken != "" {
+		auth.RefreshToken = result.RefreshToken
+	}
+	if result.ExpiresAt > 0 {
+		auth.ExpiresAt = result.ExpiresAt
+	}
+	if result.RefreshExpiresAt > 0 {
+		auth.RefreshExpiresAt = result.RefreshExpiresAt
+	}
+	if result.APIHost != "" {
+		auth.APIHost = result.APIHost
 	}
 }
 
@@ -814,12 +1175,238 @@ func randomHex(n int) (string, error) {
 	return hex.EncodeToString(buf), nil
 }
 
-func machineTraceID(machineID, deviceID string) string {
-	joined := machineID + deviceID
-	if len(joined) >= 16 {
-		return joined[len(joined)-16:]
+func randomUUID() (string, error) {
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
 	}
-	return strings.Repeat("0", 16-len(joined)) + joined
+	buf[6] = (buf[6] & 0x0f) | 0x40
+	buf[8] = (buf[8] & 0x3f) | 0x80
+	hexID := hex.EncodeToString(buf)
+	return hexID[0:8] + "-" + hexID[8:12] + "-" + hexID[12:16] + "-" + hexID[16:20] + "-" + hexID[20:32], nil
+}
+
+func generatePKCE() (string, string, error) {
+	random := make([]byte, 48)
+	if _, err := rand.Read(random); err != nil {
+		return "", "", err
+	}
+	verifier := base64.RawURLEncoding.EncodeToString(random)
+	digest := sha256.Sum256([]byte(verifier))
+	challenge := base64.RawURLEncoding.EncodeToString(digest[:])
+	return verifier, challenge, nil
+}
+
+func generateDevicePublicKey() (string, error) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return "", fmt.Errorf("generate TRAE device key: %w", err)
+	}
+	der, err := x509.MarshalPKIXPublicKey(&key.PublicKey)
+	if err != nil {
+		return "", fmt.Errorf("marshal TRAE device key: %w", err)
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der})), nil
+}
+
+func loginDeviceID(configured string) string {
+	configured = strings.TrimSpace(configured)
+	if configured == "" {
+		return "0"
+	}
+	for _, r := range configured {
+		if r < '0' || r > '9' {
+			return "0"
+		}
+	}
+	return configured
+}
+
+func inferLoginRegion(loginHost, platform string) string {
+	if strings.HasPrefix(platform, "cn") {
+		return "cn"
+	}
+	lower := strings.ToLower(loginHost)
+	if strings.Contains(lower, ".cn") {
+		return "cn"
+	}
+	if strings.Contains(lower, ".us") || strings.Contains(lower, "us-") {
+		return "us"
+	}
+	return "sg"
+}
+
+func domainForPlatform(platform string) string {
+	if strings.HasPrefix(platform, "cn") {
+		return "trae.cn"
+	}
+	return "trae.ai"
+}
+
+func apiBaseURLForRegion(region, platform, fallback string) string {
+	fallback = strings.TrimRight(strings.TrimSpace(fallback), "/")
+	if fallback != "" && !strings.Contains(strings.ToLower(fallback), "trae-api-") {
+		return fallback
+	}
+	if strings.HasPrefix(platform, "cn") || strings.EqualFold(region, "cn") {
+		return "https://trae-api-cn.mchost.guru"
+	}
+	switch strings.ToLower(strings.TrimSpace(region)) {
+	case "us", "usttp", "us_ttp", "us-ttp":
+		return "https://trae-api-us.mchost.guru"
+	case "sg", "row", "global", "":
+		return "https://trae-api-sg.mchost.guru"
+	default:
+		if strings.TrimSpace(fallback) != "" {
+			return fallback
+		}
+		return "https://trae-api-sg.mchost.guru"
+	}
+}
+
+func deviceBrandForType(deviceType, fallback string) string {
+	switch strings.ToLower(deviceType) {
+	case "mac", "darwin":
+		return "Apple"
+	case "windows":
+		return "Microsoft"
+	case "linux":
+		return "Linux"
+	default:
+		return fallback
+	}
+}
+
+func urlOrigin(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return ""
+	}
+	return u.Scheme + "://" + u.Host
+}
+
+func isCustomOAuthHost(host, platform string) bool {
+	host = strings.TrimRight(strings.TrimSpace(host), "/")
+	if host == "" {
+		return false
+	}
+	if strings.HasPrefix(platform, "cn") {
+		return host != "https://api.trae.com.cn" && host != "https://api.trae.cn"
+	}
+	return host != "https://api.trae.ai"
+}
+
+func dedupeStrings(values []string) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimRight(strings.TrimSpace(value), "/")
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func firstPositive(values ...int64) int64 {
+	for _, value := range values {
+		if value > 0 {
+			return value
+		}
+	}
+	return 0
+}
+
+func nestedString(root map[string]any, path ...string) string {
+	var current any = root
+	for _, key := range path {
+		obj, ok := current.(map[string]any)
+		if !ok {
+			return ""
+		}
+		current, ok = obj[key]
+		if !ok {
+			return ""
+		}
+	}
+	switch value := current.(type) {
+	case string:
+		return strings.TrimSpace(value)
+	case json.Number:
+		return value.String()
+	default:
+		return ""
+	}
+}
+
+func nestedInt64(root map[string]any, path ...string) int64 {
+	var current any = root
+	for _, key := range path {
+		obj, ok := current.(map[string]any)
+		if !ok {
+			return 0
+		}
+		current, ok = obj[key]
+		if !ok {
+			return 0
+		}
+	}
+	return anyInt64(current)
+}
+
+func findStringByKeys(root map[string]any, keys ...string) string {
+	if root == nil {
+		return ""
+	}
+	wanted := map[string]struct{}{}
+	for _, key := range keys {
+		wanted[key] = struct{}{}
+	}
+	var walk func(any) string
+	walk = func(value any) string {
+		switch node := value.(type) {
+		case map[string]any:
+			for key, child := range node {
+				if _, ok := wanted[key]; ok {
+					switch v := child.(type) {
+					case string:
+						if strings.TrimSpace(v) != "" {
+							return strings.TrimSpace(v)
+						}
+					case json.Number:
+						return v.String()
+					}
+				}
+			}
+			for _, child := range node {
+				if found := walk(child); found != "" {
+					return found
+				}
+			}
+		case []any:
+			for _, child := range node {
+				if found := walk(child); found != "" {
+					return found
+				}
+			}
+		}
+		return ""
+	}
+	return walk(root)
 }
 
 func (m *Manager) setLastError(message string) {

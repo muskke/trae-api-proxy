@@ -81,10 +81,13 @@ func TestOAuthCallbackUsesDedicatedLoopbackListener(t *testing.T) {
 func validConfig() *Config {
 	return &Config{
 		AuthMode:          "auto",
+		OAuthPlatform:     DefaultOAuthPlatform,
 		AuthFile:          DefaultAuthFile,
 		APIBaseURL:        "https://example.com",
 		OAuthHost:         DefaultOAuthHost,
 		OAuthConsoleURL:   DefaultOAuthConsoleURL,
+		OAuthClientID:     DefaultOAuthClientID,
+		OAuthGuidanceURLs: append([]string(nil), DefaultGlobalLoginGuidanceURLs...),
 		OAuthCallbackBase: "http://127.0.0.1:8000",
 		Bind:              "127.0.0.1",
 		Port:              "8000",
@@ -97,5 +100,33 @@ func validConfig() *Config {
 		OAuthRefreshEvery: time.Minute,
 		OAuthLoginTTL:     time.Minute,
 		MaxBodyBytes:      1024,
+	}
+}
+
+func TestParseInstalledProductSelectsPlatformClient(t *testing.T) {
+	root := map[string]any{
+		"tronBuildVersion": "3.5.99-build",
+		"appVersion":       "3.5.99",
+		"quality":          "stable",
+		"iCubeApp": map[string]any{
+			"authConfig": map[string]any{
+				"TRAE": map[string]any{
+					"stable": "trae-global-client",
+				},
+				"SOLO": map[string]any{
+					"stable": "solo-client",
+				},
+			},
+		},
+	}
+
+	trae := parseInstalledProduct(root, "global")
+	if trae.PluginVersion != "3.5.99-build" || trae.AppVersion != "3.5.99" || trae.ClientID != "trae-global-client" {
+		t.Fatalf("global TRAE product = %+v", trae)
+	}
+
+	solo := parseInstalledProduct(root, "global-solo")
+	if solo.ClientID != "solo-client" {
+		t.Fatalf("global SOLO client id = %q", solo.ClientID)
 	}
 }

@@ -40,6 +40,7 @@ func main() {
 	mux.HandleFunc("GET /auth/status", h.HandleAuthStatus)
 	mux.HandleFunc("GET /auth/login", h.HandleAuthLogin)
 	mux.HandleFunc("GET /auth/callback/{state}", h.HandleAuthCallback)
+	mux.HandleFunc("GET /authorize", h.HandleAuthCallback)
 	mux.HandleFunc("POST /auth/refresh", h.HandleAuthRefresh)
 	mux.HandleFunc("POST /auth/logout", h.HandleAuthLogout)
 	mux.HandleFunc("GET /v1/models", h.HandleModels)
@@ -60,6 +61,7 @@ func main() {
 	if callbackAddr, localCallback := cfg.OAuthCallbackListenAddr(); localCallback && !cfg.PrimaryServesOAuthCallback() {
 		callbackMux := http.NewServeMux()
 		callbackMux.HandleFunc("GET /auth/callback/{state}", h.HandleAuthCallback)
+		callbackMux.HandleFunc("GET /authorize", h.HandleAuthCallback)
 		callbackHandler := middleware.Chain(
 			callbackMux,
 			middleware.RequestID,

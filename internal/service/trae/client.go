@@ -24,11 +24,13 @@ const (
 )
 
 type Session struct {
-	Token     string
-	UID       string
-	MachineID string
-	DeviceID  string
-	Source    string
+	Token      string
+	UID        string
+	MachineID  string
+	DeviceID   string
+	APIBaseURL string
+	Platform   string
+	Source     string
 }
 
 type Model struct {
@@ -128,6 +130,13 @@ func (c *Client) headers(session Session, accept string) http.Header {
 	return h
 }
 
+func (c *Client) baseURL(session Session) string {
+	if strings.TrimSpace(session.APIBaseURL) != "" {
+		return strings.TrimRight(session.APIBaseURL, "/")
+	}
+	return strings.TrimRight(c.Config.APIBaseURL, "/")
+}
+
 func firstNonEmpty(values ...string) string {
 	for _, value := range values {
 		if strings.TrimSpace(value) != "" {
@@ -198,9 +207,9 @@ func (c *Client) fetchModelsMode(ctx context.Context, session Session, mode stri
 			"agent_type":          nil,
 		}
 		body, _ := json.Marshal(payload)
-		req, err = http.NewRequestWithContext(ctx, http.MethodPost, c.Config.APIBaseURL+soloModelsPath, bytes.NewReader(body))
+		req, err = http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL(session)+soloModelsPath, bytes.NewReader(body))
 	} else {
-		req, err = http.NewRequestWithContext(ctx, http.MethodGet, c.Config.APIBaseURL+legacyModels, nil)
+		req, err = http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL(session)+legacyModels, nil)
 	}
 	if err != nil {
 		return nil, err
@@ -306,7 +315,7 @@ func (c *Client) chatMode(ctx context.Context, session Session, model string, ra
 		return nil, err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.Config.APIBaseURL+path, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL(session)+path, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
