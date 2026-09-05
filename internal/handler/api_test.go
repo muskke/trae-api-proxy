@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -15,6 +16,7 @@ import (
 	traeauth "github.com/muskke/trae-api-proxy/internal/auth"
 	"github.com/muskke/trae-api-proxy/internal/config"
 	"github.com/muskke/trae-api-proxy/internal/service/trae"
+	"github.com/muskke/trae-api-proxy/internal/service/websearch"
 )
 
 func TestChatAuthUsesConfiguredUpstreamToken(t *testing.T) {
@@ -663,5 +665,78 @@ func TestResponsesCustomToolRoundTrip(t *testing.T) {
 	h.HandleResponses(secondRec, second)
 	if secondRec.Code != http.StatusOK || !strings.Contains(secondRec.Body.String(), "patch applied") || calls.Load() != 2 {
 		t.Fatalf("second response status=%d calls=%d body=%s", secondRec.Code, calls.Load(), secondRec.Body.String())
+	}
+}
+
+type handlerFakeWebSearch struct {
+	calls atomic.Int32
+}
+
+func (f *handlerFakeWebSearch) Backend() string { return "fake" }
+
+func (f *handlerFakeWebSearch) Execute(_ context.Context, action websearch.Action, _ websearch.ToolOptions) (websearch.Result, error) {
+	f.calls.Add(1)
+	return websearch.Result{
+		Action:  action,
+		Sources: []websearch.Source{{Title: "Example", URL: "https://example.com/current"}},
+		Content: "Fresh information from the web runtime.",
+	}, nil
+}
+
+func TestResponsesHostedWebSearchRuntime(t *testing.T) {
+	var upstreamCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		call := upstreamCalls.Add(1)
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode upstream body: %v", err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		if call == 1 {
+			_, _ = io.WriteString(w, "event: output\ndata: {\"tool_calls\":[{\"index\":0,\"id\":\"call_web\",\"function_call\":{\"name\":\"web_search\",\"arguments\":\"{\\\"action\\\":\\\"search\\\",\\\"query\\\":\\\"current release\\\"}\"}}]}\n\nevent: done\ndata: {\"finish_reason\":\"tool_calls\"}\n\n")
+			return
+		}
+		messages := body["messages"].([]any)
+		last := messages[len(messages)-1].(map[string]any)
+		lastJSON, _ := json.Marshal(last)
+		if last["role"] != "tool" || !strings.Contains(string(lastJSON), "Fresh information") {
+			t.Fatalf("hosted search result was not returned to model: %#v", last)
+		}
+		_, _ = io.WriteString(w, "event: output\ndata: {\"response\":\"Current answer from searched sources.\"}\n\nevent: done\ndata: {\"finish_reason\":\"stop\"}\n\n")
+	}))
+	defer upstream.Close()
+
+	h := newTestHandler(upstream.URL)
+	fakeSearch := &handlerFakeWebSearch{}
+	h.WebSearch = fakeSearch
+	h.Config.HostedToolMaxSteps = 4
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+		"model":"gpt-5.4",
+		"input":"What is the current release?",
+		"stream":true,
+		"tools":[{"type":"web_search","search_context_size":"low"}]
+	}`))
+	req.Header.Set("Authorization", "Bearer client-secret")
+	rec := httptest.NewRecorder()
+	h.HandleResponses(rec, req)
+
+	if rec.Code != http.StatusOK || upstreamCalls.Load() != 2 || fakeSearch.calls.Load() != 1 {
+		t.Fatalf("status=%d upstream=%d search=%d body=%s", rec.Code, upstreamCalls.Load(), fakeSearch.calls.Load(), rec.Body.String())
+	}
+	if rec.Header().Get("X-Trae-Hosted-Tool-Runtime") != "web_search" || rec.Header().Get("X-Trae-Web-Search-Backend") != "fake" {
+		t.Fatalf("hosted headers = %#v", rec.Header())
+	}
+	body := rec.Body.String()
+	for _, needle := range []string{
+		"event: response.web_search_call.in_progress",
+		"event: response.web_search_call.searching",
+		"event: response.web_search_call.completed",
+		`"type":"web_search_call"`,
+		"Current answer from searched sources.",
+		"event: response.completed",
+	} {
+		if !strings.Contains(body, needle) {
+			t.Fatalf("missing %q in hosted response:\n%s", needle, body)
+		}
 	}
 }

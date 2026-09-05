@@ -96,7 +96,7 @@ func main() {
 			oauthHost = cfg.OAuthHost
 		}
 		function := traeClient.FunctionFor(trae.Session{Platform: platform}, cfg.DefaultModel)
-		log.Printf("trae-api-proxy listening on %s upstream_mode=%s auth_mode=%s auth_source=%s platform=%s region=%s function=%s chat_upstream=%s oauth_host=%s reasoning=%s model_status_file=%s", srv.Addr, cfg.UpstreamMode, cfg.AuthMode, authStatus.Source, platform, authStatus.LoginRegion, function, chatUpstream, oauthHost, cfg.ReasoningMode, cfg.ModelStatusFile)
+		log.Printf("trae-api-proxy listening on %s upstream_mode=%s auth_mode=%s auth_source=%s platform=%s region=%s function=%s chat_upstream=%s oauth_host=%s reasoning=%s model_status_file=%s web_search_backend=%s hosted_tool_max_steps=%d", srv.Addr, cfg.UpstreamMode, cfg.AuthMode, authStatus.Source, platform, authStatus.LoginRegion, function, chatUpstream, oauthHost, cfg.ReasoningMode, cfg.ModelStatusFile, cfg.WebSearchBackend, cfg.HostedToolMaxSteps)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("listen: %v", err)
 		}

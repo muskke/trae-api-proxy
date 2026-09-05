@@ -32,6 +32,8 @@ const (
 	DefaultAuthFile                  = "./data/trae-auth.json"
 	DefaultModelStatusFile           = "./data/model-status.json"
 	DefaultReasoningMode             = "preserve"
+	DefaultWebSearchBackend          = "duckduckgo"
+	DefaultWebSearchEndpoint         = "https://html.duckduckgo.com/html/"
 	DefaultAppID                     = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8"
 	DefaultIDEVersion                = "3.5.66"
 	DefaultIDEVersionCode            = "20260811"
@@ -54,6 +56,10 @@ const (
 	defaultRefreshInterval           = 15 * time.Minute
 	defaultLoginTTL                  = 10 * time.Minute
 	defaultMaxBodyBytes              = int64(8 << 20)
+	defaultWebSearchTimeout          = 20 * time.Second
+	defaultWebSearchMaxResults       = int64(8)
+	defaultWebSearchMaxPageBytes     = int64(2 << 20)
+	defaultHostedToolMaxSteps        = int64(6)
 )
 
 var (
@@ -70,40 +76,46 @@ var (
 )
 
 type Config struct {
-	AuthToken          string
-	AuthMode           string
-	AuthFile           string
-	AppID              string
-	AppVersion         string
-	DeviceBrand        string
-	DeviceCPU          string
-	DeviceID           string
-	DeviceType         string
-	IDEVersion         string
-	IDEVersionCode     string
-	IDEVersionType     string
-	MachineID          string
-	OSVersion          string
-	UID                string
-	APIBaseURL         string
-	Bind               string
-	Port               string
-	Locale             string
-	IdeToken           string
-	UpstreamMode       string
-	DefaultModel       string
-	ModelAliases       map[string]string
-	RequestTrafficType string
-	RequestTimeout     time.Duration
-	HeaderTimeout      time.Duration
-	ShutdownTimeout    time.Duration
-	ModelCacheTTL      time.Duration
-	ModelFailureTTL    time.Duration
-	ModelSuccessTTL    time.Duration
-	ModelStatusFile    string
-	ReasoningMode      string
-	MaxBodyBytes       int64
-	CORSAllowOrigin    string
+	AuthToken             string
+	AuthMode              string
+	AuthFile              string
+	AppID                 string
+	AppVersion            string
+	DeviceBrand           string
+	DeviceCPU             string
+	DeviceID              string
+	DeviceType            string
+	IDEVersion            string
+	IDEVersionCode        string
+	IDEVersionType        string
+	MachineID             string
+	OSVersion             string
+	UID                   string
+	APIBaseURL            string
+	Bind                  string
+	Port                  string
+	Locale                string
+	IdeToken              string
+	UpstreamMode          string
+	DefaultModel          string
+	ModelAliases          map[string]string
+	RequestTrafficType    string
+	RequestTimeout        time.Duration
+	HeaderTimeout         time.Duration
+	ShutdownTimeout       time.Duration
+	ModelCacheTTL         time.Duration
+	ModelFailureTTL       time.Duration
+	ModelSuccessTTL       time.Duration
+	ModelStatusFile       string
+	ReasoningMode         string
+	MaxBodyBytes          int64
+	CORSAllowOrigin       string
+	WebSearchBackend      string
+	WebSearchEndpoint     string
+	WebSearchTimeout      time.Duration
+	WebSearchMaxResults   int
+	WebSearchMaxPageBytes int64
+	HostedToolMaxSteps    int
 
 	OAuthPlatform             string
 	OAuthHost                 string
@@ -143,40 +155,46 @@ func Load() *Config {
 	}
 
 	return &Config{
-		AuthToken:          os.Getenv("AUTH_TOKEN"),
-		AuthMode:           strings.ToLower(utils.EnvOrDefault("TRAE_AUTH_MODE", DefaultAuthMode)),
-		AuthFile:           utils.EnvOrDefault("TRAE_AUTH_FILE", DefaultAuthFile),
-		AppID:              utils.EnvOrDefault("TRAE_APP_ID", DefaultAppID),
-		AppVersion:         utils.EnvOrDefault("TRAE_APP_VERSION", DefaultApplicationVer),
-		DeviceBrand:        utils.EnvOrDefault("TRAE_DEVICE_BRAND", defaultDeviceBrand()),
-		DeviceCPU:          os.Getenv("TRAE_DEVICE_CPU"),
-		DeviceID:           os.Getenv("TRAE_DEVICE_ID"),
-		DeviceType:         utils.EnvOrDefault("TRAE_DEVICE_TYPE", defaultDeviceType()),
-		IdeToken:           os.Getenv("TRAE_IDE_TOKEN"),
-		IDEVersion:         ideVersion,
-		IDEVersionCode:     utils.EnvOrDefault("TRAE_IDE_VERSION_CODE", DefaultIDEVersionCode),
-		IDEVersionType:     utils.EnvOrDefault("TRAE_IDE_VERSION_TYPE", DefaultIDEVersionType),
-		MachineID:          os.Getenv("TRAE_MACHINE_ID"),
-		OSVersion:          utils.EnvOrDefault("TRAE_OS_VERSION", defaultOSVersion()),
-		UID:                os.Getenv("TRAE_UID"),
-		APIBaseURL:         strings.TrimRight(utils.EnvOrDefault("TRAE_API_BASE_URL", defaults.APIBaseURL), "/"),
-		Bind:               utils.EnvOrDefault("BIND", utils.EnvOrDefault("HOST", "0.0.0.0")),
-		Port:               port,
-		Locale:             utils.EnvOrDefault("TRAE_LOCALE", defaults.Locale),
-		UpstreamMode:       strings.ToLower(utils.EnvOrDefault("TRAE_UPSTREAM_MODE", DefaultUpstreamMode)),
-		DefaultModel:       utils.EnvOrDefault("TRAE_DEFAULT_MODEL", DefaultModel),
-		ModelAliases:       parseAliases(os.Getenv("TRAE_MODEL_ALIASES")),
-		RequestTrafficType: utils.EnvOrDefault("TRAE_REQUEST_TRAFFIC_TYPE", DefaultRequestTraffic),
-		RequestTimeout:     envDuration("TRAE_REQUEST_TIMEOUT", defaultRequestTimeout),
-		HeaderTimeout:      envDuration("TRAE_RESPONSE_HEADER_TIMEOUT", defaultHeaderTimeout),
-		ShutdownTimeout:    envDuration("SHUTDOWN_TIMEOUT", defaultShutdownTimeout),
-		ModelCacheTTL:      envDuration("TRAE_MODEL_CACHE_TTL", defaultModelCacheTTL),
-		ModelFailureTTL:    envDuration("TRAE_MODEL_FAILURE_TTL", defaultModelFailureTTL),
-		ModelSuccessTTL:    envDuration("TRAE_MODEL_SUCCESS_TTL", defaultModelSuccessTTL),
-		ModelStatusFile:    utils.EnvOrDefault("TRAE_MODEL_STATUS_FILE", DefaultModelStatusFile),
-		ReasoningMode:      strings.ToLower(utils.EnvOrDefault("TRAE_REASONING_MODE", DefaultReasoningMode)),
-		MaxBodyBytes:       envInt64("MAX_BODY_BYTES", defaultMaxBodyBytes),
-		CORSAllowOrigin:    os.Getenv("CORS_ALLOW_ORIGIN"),
+		AuthToken:             os.Getenv("AUTH_TOKEN"),
+		AuthMode:              strings.ToLower(utils.EnvOrDefault("TRAE_AUTH_MODE", DefaultAuthMode)),
+		AuthFile:              utils.EnvOrDefault("TRAE_AUTH_FILE", DefaultAuthFile),
+		AppID:                 utils.EnvOrDefault("TRAE_APP_ID", DefaultAppID),
+		AppVersion:            utils.EnvOrDefault("TRAE_APP_VERSION", DefaultApplicationVer),
+		DeviceBrand:           utils.EnvOrDefault("TRAE_DEVICE_BRAND", defaultDeviceBrand()),
+		DeviceCPU:             os.Getenv("TRAE_DEVICE_CPU"),
+		DeviceID:              os.Getenv("TRAE_DEVICE_ID"),
+		DeviceType:            utils.EnvOrDefault("TRAE_DEVICE_TYPE", defaultDeviceType()),
+		IdeToken:              os.Getenv("TRAE_IDE_TOKEN"),
+		IDEVersion:            ideVersion,
+		IDEVersionCode:        utils.EnvOrDefault("TRAE_IDE_VERSION_CODE", DefaultIDEVersionCode),
+		IDEVersionType:        utils.EnvOrDefault("TRAE_IDE_VERSION_TYPE", DefaultIDEVersionType),
+		MachineID:             os.Getenv("TRAE_MACHINE_ID"),
+		OSVersion:             utils.EnvOrDefault("TRAE_OS_VERSION", defaultOSVersion()),
+		UID:                   os.Getenv("TRAE_UID"),
+		APIBaseURL:            strings.TrimRight(utils.EnvOrDefault("TRAE_API_BASE_URL", defaults.APIBaseURL), "/"),
+		Bind:                  utils.EnvOrDefault("BIND", utils.EnvOrDefault("HOST", "0.0.0.0")),
+		Port:                  port,
+		Locale:                utils.EnvOrDefault("TRAE_LOCALE", defaults.Locale),
+		UpstreamMode:          strings.ToLower(utils.EnvOrDefault("TRAE_UPSTREAM_MODE", DefaultUpstreamMode)),
+		DefaultModel:          utils.EnvOrDefault("TRAE_DEFAULT_MODEL", DefaultModel),
+		ModelAliases:          parseAliases(os.Getenv("TRAE_MODEL_ALIASES")),
+		RequestTrafficType:    utils.EnvOrDefault("TRAE_REQUEST_TRAFFIC_TYPE", DefaultRequestTraffic),
+		RequestTimeout:        envDuration("TRAE_REQUEST_TIMEOUT", defaultRequestTimeout),
+		HeaderTimeout:         envDuration("TRAE_RESPONSE_HEADER_TIMEOUT", defaultHeaderTimeout),
+		ShutdownTimeout:       envDuration("SHUTDOWN_TIMEOUT", defaultShutdownTimeout),
+		ModelCacheTTL:         envDuration("TRAE_MODEL_CACHE_TTL", defaultModelCacheTTL),
+		ModelFailureTTL:       envDuration("TRAE_MODEL_FAILURE_TTL", defaultModelFailureTTL),
+		ModelSuccessTTL:       envDuration("TRAE_MODEL_SUCCESS_TTL", defaultModelSuccessTTL),
+		ModelStatusFile:       utils.EnvOrDefault("TRAE_MODEL_STATUS_FILE", DefaultModelStatusFile),
+		ReasoningMode:         strings.ToLower(utils.EnvOrDefault("TRAE_REASONING_MODE", DefaultReasoningMode)),
+		MaxBodyBytes:          envInt64("MAX_BODY_BYTES", defaultMaxBodyBytes),
+		CORSAllowOrigin:       os.Getenv("CORS_ALLOW_ORIGIN"),
+		WebSearchBackend:      strings.ToLower(utils.EnvOrDefault("TRAE_WEB_SEARCH_BACKEND", DefaultWebSearchBackend)),
+		WebSearchEndpoint:     utils.EnvOrDefault("TRAE_WEB_SEARCH_ENDPOINT", DefaultWebSearchEndpoint),
+		WebSearchTimeout:      envDuration("TRAE_WEB_SEARCH_TIMEOUT", defaultWebSearchTimeout),
+		WebSearchMaxResults:   int(envInt64("TRAE_WEB_SEARCH_MAX_RESULTS", defaultWebSearchMaxResults)),
+		WebSearchMaxPageBytes: envInt64("TRAE_WEB_SEARCH_MAX_PAGE_BYTES", defaultWebSearchMaxPageBytes),
+		HostedToolMaxSteps:    int(envInt64("TRAE_HOSTED_TOOL_MAX_STEPS", defaultHostedToolMaxSteps)),
 
 		OAuthPlatform:             platform,
 		OAuthHost:                 strings.TrimRight(utils.EnvOrDefault("TRAE_OAUTH_HOST", defaults.OAuthHost), "/"),
@@ -315,6 +333,11 @@ func (c *Config) Validate() error {
 	default:
 		return fmt.Errorf("TRAE_REASONING_MODE must be preserve, merge, or drop")
 	}
+	switch c.WebSearchBackend {
+	case "duckduckgo", "ddg", "auto", "searxng":
+	default:
+		return fmt.Errorf("TRAE_WEB_SEARCH_BACKEND must be duckduckgo, ddg, auto, or searxng")
+	}
 
 	if err := validateAbsoluteHTTPURL("TRAE_API_BASE_URL", c.APIBaseURL); err != nil {
 		return err
@@ -359,7 +382,13 @@ func (c *Config) Validate() error {
 	if strings.TrimSpace(c.ModelStatusFile) == "" {
 		return fmt.Errorf("TRAE_MODEL_STATUS_FILE must not be empty")
 	}
-	if c.RequestTimeout <= 0 || c.HeaderTimeout <= 0 || c.ShutdownTimeout <= 0 || c.ModelCacheTTL <= 0 || c.ModelFailureTTL <= 0 || c.ModelSuccessTTL <= 0 || c.OAuthRefreshSkew <= 0 || c.OAuthRefreshEvery <= 0 || c.OAuthLoginTTL <= 0 {
+	if err := validateAbsoluteHTTPURL("TRAE_WEB_SEARCH_ENDPOINT", c.WebSearchEndpoint); err != nil {
+		return err
+	}
+	if c.WebSearchMaxResults <= 0 || c.WebSearchMaxPageBytes <= 0 || c.HostedToolMaxSteps <= 0 {
+		return fmt.Errorf("web search limits and TRAE_HOSTED_TOOL_MAX_STEPS must be greater than zero")
+	}
+	if c.RequestTimeout <= 0 || c.HeaderTimeout <= 0 || c.ShutdownTimeout <= 0 || c.ModelCacheTTL <= 0 || c.ModelFailureTTL <= 0 || c.ModelSuccessTTL <= 0 || c.OAuthRefreshSkew <= 0 || c.OAuthRefreshEvery <= 0 || c.OAuthLoginTTL <= 0 || c.WebSearchTimeout <= 0 {
 		return fmt.Errorf("timeout values, refresh intervals, and model cache TTLs must be greater than zero")
 	}
 	return nil

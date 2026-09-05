@@ -1,10 +1,16 @@
 package trae
 
 import (
+	"context"
 	"encoding/json"
+	"io"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/muskke/trae-api-proxy/internal/config"
+	"github.com/muskke/trae-api-proxy/internal/service/websearch"
 )
 
 func TestConvertResponsesRequestToChat(t *testing.T) {
@@ -416,5 +422,140 @@ func TestResponsesObjectUsesEmptyToolArray(t *testing.T) {
 	tools, ok := result["tools"].([]any)
 	if !ok || tools == nil || len(tools) != 0 {
 		t.Fatalf("tools must be a non-nil empty array, got %#v", result["tools"])
+	}
+}
+
+func TestConvertResponsesWebSearchTool(t *testing.T) {
+	ctx, err := ConvertResponsesRequest([]byte(`{
+		"model":"gpt-5.4",
+		"input":"what happened today?",
+		"tools":[{
+			"type":"web_search",
+			"search_context_size":"high",
+			"filters":{"allowed_domains":["example.com"]},
+			"user_location":{"type":"approximate","country":"SG"}
+		}]
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ctx.HostedWebSearch == nil {
+		t.Fatal("expected hosted web search options")
+	}
+	if ctx.HostedWebSearch.SearchContextSize != "high" || len(ctx.HostedWebSearch.AllowedDomains) != 1 || ctx.HostedWebSearch.AllowedDomains[0] != "example.com" {
+		t.Fatalf("web search options = %#v", ctx.HostedWebSearch)
+	}
+	var chat map[string]any
+	if err := json.Unmarshal(ctx.ChatBody, &chat); err != nil {
+		t.Fatal(err)
+	}
+	tools := chat["tools"].([]any)
+	if len(tools) != 1 {
+		t.Fatalf("tools = %#v", tools)
+	}
+	fn := tools[0].(map[string]any)["function"].(map[string]any)
+	if fn["name"] != "web_search" {
+		t.Fatalf("web search bridge name = %#v", fn["name"])
+	}
+}
+
+func TestConvertResponsesAcceptsWebSearchCallHistory(t *testing.T) {
+	ctx, err := ConvertResponsesRequest([]byte(`{
+		"model":"gpt-5.4",
+		"input":[
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"latest news"}]},
+			{"type":"web_search_call","id":"ws_1","status":"completed","action":{"type":"search","query":"latest news"}},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Here is the result."}]}
+		],
+		"tools":[{"type":"web_search"}]
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var chat map[string]any
+	if err := json.Unmarshal(ctx.ChatBody, &chat); err != nil {
+		t.Fatal(err)
+	}
+	messages := chat["messages"].([]any)
+	if len(messages) != 2 {
+		t.Fatalf("web_search_call history should be ignored as provider artifact; messages = %#v", messages)
+	}
+}
+
+type fakeHostedWebSearch struct {
+	calls []websearch.Action
+}
+
+func (f *fakeHostedWebSearch) Backend() string { return "fake" }
+
+func (f *fakeHostedWebSearch) Execute(_ context.Context, action websearch.Action, _ websearch.ToolOptions) (websearch.Result, error) {
+	f.calls = append(f.calls, action)
+	return websearch.Result{
+		Action:  action,
+		Sources: []websearch.Source{{Title: "Example", URL: "https://example.com/latest", Snippet: "Current result"}},
+		Content: "Current result from the web",
+	}, nil
+}
+
+func TestExecuteResponsesWithHostedWebSearch(t *testing.T) {
+	var upstreamBodies [][]byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		upstreamBodies = append(upstreamBodies, append([]byte(nil), body...))
+		w.Header().Set("Content-Type", "text/event-stream")
+		if len(upstreamBodies) == 1 {
+			_, _ = io.WriteString(w, "event: output\ndata: {\"tool_calls\":[{\"index\":0,\"id\":\"call_web_1\",\"function_call\":{\"name\":\"web_search\",\"arguments\":\"{\\\"action\\\":\\\"search\\\",\\\"query\\\":\\\"OpenAI latest\\\"}\"}}]}\n\nevent: done\ndata: {\"finish_reason\":\"tool_calls\"}\n\n")
+			return
+		}
+		_, _ = io.WriteString(w, "event: output\ndata: {\"response\":\"The web result says hello.\"}\n\nevent: done\ndata: {\"finish_reason\":\"stop\"}\n\n")
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{APIBaseURL: server.URL, UpstreamMode: "solo"}
+	client := NewClient(cfg)
+	request, err := ConvertResponsesRequest([]byte(`{"model":"gpt-5.4","input":"what is new?","tools":[{"type":"web_search"}],"stream":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := &fakeHostedWebSearch{}
+	execution, err := client.ExecuteResponsesWithHostedTools(context.Background(), Session{APIBaseURL: server.URL, Platform: "global"}, "gpt-5.4", request, runtime, TransformOptions{ReasoningMode: "preserve"}, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runtime.calls) != 1 || runtime.calls[0].Type != "search" || runtime.calls[0].Query != "OpenAI latest" {
+		t.Fatalf("runtime calls = %#v", runtime.calls)
+	}
+	if len(upstreamBodies) != 2 || !strings.Contains(string(upstreamBodies[1]), `"role":"tool"`) || !strings.Contains(string(upstreamBodies[1]), "Current result from the web") {
+		t.Fatalf("second upstream body = %s", upstreamBodies[len(upstreamBodies)-1])
+	}
+	output := execution.Response["output"].([]any)
+	if len(output) < 2 {
+		t.Fatalf("response output = %#v", output)
+	}
+	searchItem := output[0].(map[string]any)
+	if searchItem["type"] != "web_search_call" || searchItem["status"] != "completed" {
+		t.Fatalf("web search output item = %#v", searchItem)
+	}
+	message := output[len(output)-1].(map[string]any)
+	if message["type"] != "message" {
+		t.Fatalf("final item = %#v", message)
+	}
+
+	recorder := httptest.NewRecorder()
+	if err := StreamHostedResponses(recorder, execution, request); err != nil {
+		t.Fatal(err)
+	}
+	stream := recorder.Body.String()
+	for _, needle := range []string{
+		"event: response.web_search_call.in_progress",
+		"event: response.web_search_call.searching",
+		"event: response.web_search_call.completed",
+		`"type":"web_search_call"`,
+		"event: response.output_text.delta",
+		"event: response.completed",
+	} {
+		if !strings.Contains(stream, needle) {
+			t.Fatalf("missing %q in hosted Responses stream:\n%s", needle, stream)
+		}
 	}
 }

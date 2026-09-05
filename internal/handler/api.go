@@ -16,16 +16,25 @@ import (
 	traeauth "github.com/muskke/trae-api-proxy/internal/auth"
 	"github.com/muskke/trae-api-proxy/internal/config"
 	"github.com/muskke/trae-api-proxy/internal/service/trae"
+	"github.com/muskke/trae-api-proxy/internal/service/websearch"
 )
 
 type APIHandler struct {
-	Config *config.Config
-	Client *trae.Client
-	Auth   *traeauth.Manager
+	Config    *config.Config
+	Client    *trae.Client
+	Auth      *traeauth.Manager
+	WebSearch trae.HostedWebSearchExecutor
 }
 
 func NewAPIHandler(cfg *config.Config, client *trae.Client, authManager *traeauth.Manager) *APIHandler {
-	return &APIHandler{Config: cfg, Client: client, Auth: authManager}
+	searchRuntime := websearch.New(websearch.Config{
+		Backend:      cfg.WebSearchBackend,
+		Endpoint:     cfg.WebSearchEndpoint,
+		Timeout:      cfg.WebSearchTimeout,
+		MaxResults:   cfg.WebSearchMaxResults,
+		MaxPageBytes: cfg.WebSearchMaxPageBytes,
+	})
+	return &APIHandler{Config: cfg, Client: client, Auth: authManager, WebSearch: searchRuntime}
 }
 
 func (h *APIHandler) HandleRoot(w http.ResponseWriter, _ *http.Request) {
@@ -81,6 +90,11 @@ func (h *APIHandler) HandleStatus(w http.ResponseWriter, r *http.Request) {
 		"client_auth_enabled":       h.Config.AuthToken != "",
 		"default_model":             h.Config.DefaultModel,
 		"trae_auth":                 authStatus,
+		"hosted_tools": map[string]any{
+			"web_search": map[string]any{
+				"enabled": true, "backend": h.Config.WebSearchBackend, "max_steps": h.Config.HostedToolMaxSteps,
+			},
+		},
 	})
 }
 

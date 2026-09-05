@@ -55,6 +55,68 @@ func (h *APIHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 
 	capabilitySafe := isModelCapabilitySafeRequest(responseRequest.ChatBody)
+
+	if responseRequest.HostedWebSearch != nil {
+		w.Header().Set("X-Trae-Hosted-Tool-Runtime", "web_search")
+		if h.WebSearch != nil {
+			w.Header().Set("X-Trae-Web-Search-Backend", h.WebSearch.Backend())
+		}
+
+		execute := func(activeSession trae.Session) (*trae.HostedResponsesExecution, error) {
+			return h.Client.ExecuteResponsesWithHostedTools(
+				r.Context(),
+				activeSession,
+				model,
+				responseRequest,
+				h.WebSearch,
+				trae.TransformOptions{ReasoningMode: h.Config.ReasoningMode},
+				h.Config.HostedToolMaxSteps,
+			)
+		}
+
+		execution, hostedErr := execute(session)
+		if trae.IsUpstreamAuthError(hostedErr) && session.Source == "oauth" {
+			if refreshErr := h.Auth.ForceRefresh(r.Context()); refreshErr != nil {
+				h.writeAuthLifecycleError(w, refreshErr)
+				return
+			}
+			session, ok = h.authorizeUpstream(r, w)
+			if !ok {
+				return
+			}
+			execution, hostedErr = execute(session)
+		}
+		if hostedErr != nil {
+			// Hosted-tool requests are not safe model-capability probes: a
+			// failure may come from search execution or the hidden tool loop.
+			h.recordModelError(session, model, hostedErr, false)
+			var streamErr *trae.StreamError
+			if errors.As(hostedErr, &streamErr) {
+				writeOpenAIError(w, http.StatusBadGateway, streamErr.Code, streamErr.Message)
+				return
+			}
+			var upstreamErr *trae.UpstreamError
+			if errors.As(hostedErr, &upstreamErr) {
+				h.writeUpstreamError(w, hostedErr)
+				return
+			}
+			writeOpenAIError(w, http.StatusBadGateway, "hosted_tool_error", hostedErr.Error())
+			return
+		}
+		if execution.Mode != "" {
+			w.Header().Set("X-Upstream-Mode", execution.Mode)
+		}
+		h.Client.RecordModelSuccess(session, model)
+		if responseRequest.Stream {
+			if err := trae.StreamHostedResponses(w, execution, responseRequest); err != nil {
+				log.Printf("responses hosted-tool stream conversion error: %v", err)
+			}
+			return
+		}
+		writeJSON(w, http.StatusOK, execution.Response)
+		return
+	}
+
 	resp, mode, err := h.Client.ChatCompletion(r.Context(), session, model, responseRequest.ChatBody)
 	if trae.IsUpstreamAuthError(err) && session.Source == "oauth" {
 		if refreshErr := h.Auth.ForceRefresh(r.Context()); refreshErr != nil {

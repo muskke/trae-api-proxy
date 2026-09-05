@@ -548,6 +548,17 @@ func responseToolItemFromParts(itemID, callID string, mapping responseToolMappin
 		} else {
 			item["arguments"] = map[string]any{"query": arguments}
 		}
+	case responseToolWebSearch:
+		item["type"] = "web_search_call"
+		delete(item, "name")
+		delete(item, "call_id")
+		var action map[string]any
+		if err := json.Unmarshal([]byte(arguments), &action); err == nil {
+			if strings.TrimSpace(scalarString(action["type"])) == "" {
+				action["type"] = "search"
+			}
+			item["action"] = action
+		}
 	default:
 		item["type"] = "function_call"
 		item["arguments"] = arguments

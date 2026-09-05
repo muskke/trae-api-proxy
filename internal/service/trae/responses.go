@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+
+	"github.com/muskke/trae-api-proxy/internal/service/websearch"
 )
 
 // ResponsesRequestContext contains the OpenAI Responses request metadata that
@@ -26,14 +28,16 @@ type ResponsesRequestContext struct {
 	TopP              any
 	Text              any
 	Metadata          map[string]any
+	HostedWebSearch   *websearch.ToolOptions
 }
 
 type responseToolKind string
 
 const (
-	responseToolFunction responseToolKind = "function"
-	responseToolCustom   responseToolKind = "custom"
-	responseToolSearch   responseToolKind = "tool_search"
+	responseToolFunction  responseToolKind = "function"
+	responseToolCustom    responseToolKind = "custom"
+	responseToolSearch    responseToolKind = "tool_search"
+	responseToolWebSearch responseToolKind = "web_search"
 )
 
 type responseToolMapping struct {
@@ -50,8 +54,9 @@ type responseToolMapping struct {
 // at the API boundary and represented with a function-shaped transport inside
 // the proxy.
 type ResponsesToolBridge struct {
-	byUpstream map[string]responseToolMapping
-	byResponse map[string]responseToolMapping
+	byUpstream       map[string]responseToolMapping
+	byResponse       map[string]responseToolMapping
+	webSearchOptions *websearch.ToolOptions
 }
 
 func newResponsesToolBridge() *ResponsesToolBridge {
@@ -89,6 +94,25 @@ func (b *ResponsesToolBridge) add(mapping responseToolMapping) {
 	b.byResponse[responseToolKey(mapping.Kind, mapping.Namespace, mapping.Name)] = mapping
 }
 
+func (b *ResponsesToolBridge) setWebSearchOptions(options websearch.ToolOptions) {
+	if b == nil {
+		return
+	}
+	b.webSearchOptions = &options
+}
+
+func (b *ResponsesToolBridge) WebSearchOptions() (websearch.ToolOptions, bool) {
+	if b == nil || b.webSearchOptions == nil {
+		return websearch.ToolOptions{}, false
+	}
+	return *b.webSearchOptions, true
+}
+
+func (b *ResponsesToolBridge) HasHostedWebSearch() bool {
+	_, ok := b.WebSearchOptions()
+	return ok
+}
+
 var responseToolNameChars = regexp.MustCompile(`[^A-Za-z0-9_-]+`)
 
 func normalizeUpstreamToolName(name string) string {
@@ -124,9 +148,9 @@ func allocateUpstreamToolName(used map[string]bool, namespace, name string) stri
 
 // ConvertResponsesRequest converts the text/function-call subset of the
 // OpenAI Responses API into the Chat Completions shape already understood by
-// the TRAE transport. It intentionally rejects server-hosted tool types such
-// as MCP/web_search because those require an execution runtime, not merely a
-// wire-format translation.
+// the TRAE transport. Client-executed function/custom/tool_search tools are
+// translated directly. web_search is represented as an internal function and
+// executed by the proxy hosted-tool runtime; other hosted tool types are rejected.
 func ConvertResponsesRequest(src []byte) (*ResponsesRequestContext, error) {
 	var raw map[string]any
 	if err := json.Unmarshal(src, &raw); err != nil {
@@ -185,6 +209,9 @@ func ConvertResponsesRequest(src []byte) (*ResponsesRequestContext, error) {
 		return nil, err
 	}
 	ctx.OriginalTools = originalTools
+	if options, ok := ctx.Bridge.WebSearchOptions(); ok {
+		ctx.HostedWebSearch = &options
+	}
 
 	messages, err := convertResponsesInput(raw["input"], ctx.Instructions, ctx.Bridge)
 	if err != nil {
@@ -279,6 +306,14 @@ func convertResponsesTools(value any, bridge *ResponsesToolBridge) ([]any, []any
 			}
 			bridge.add(mapping)
 			chatTools = append(chatTools, converted)
+		case "web_search", "web_search_preview", "web_search_preview_2025_03_11":
+			converted, mapping, options, err := convertResponsesWebSearchTool(tool, used)
+			if err != nil {
+				return nil, nil, err
+			}
+			bridge.add(mapping)
+			bridge.setWebSearchOptions(options)
+			chatTools = append(chatTools, converted)
 		case "namespace":
 			namespace := strings.TrimSpace(scalarString(tool["name"]))
 			if namespace == "" {
@@ -354,6 +389,46 @@ func collectResponsesTools(topLevel any, input any) ([]any, error) {
 		tools = append(tools, loaded...)
 	}
 	return tools, nil
+}
+
+func convertResponsesWebSearchTool(tool map[string]any, used map[string]bool) (map[string]any, responseToolMapping, websearch.ToolOptions, error) {
+	options := websearch.ToolOptions{SearchContextSize: strings.ToLower(strings.TrimSpace(scalarString(tool["search_context_size"])))}
+	if filters, ok := tool["filters"].(map[string]any); ok {
+		if domains, ok := filters["allowed_domains"].([]any); ok {
+			for _, rawDomain := range domains {
+				if domain := strings.TrimSpace(scalarString(rawDomain)); domain != "" {
+					options.AllowedDomains = append(options.AllowedDomains, domain)
+				}
+			}
+		}
+	}
+	if location, ok := tool["user_location"].(map[string]any); ok {
+		options.UserLocation = location
+	}
+	if value, ok := tool["external_web_access"].(bool); ok {
+		options.ExternalWebAccess = &value
+	}
+	if value, ok := tool["indexed_web_access"].(bool); ok {
+		options.IndexedWebAccess = &value
+	}
+
+	upstreamName := allocateUpstreamToolName(used, "", "web_search")
+	description := `Search and browse the public web. Use action="search" with query or queries to find sources. Use action="open_page" with url to read a result page. Use action="find_in_page" with url and pattern to locate text on a page. Prefer search first, then open_page/find_in_page only when needed.`
+	parameters := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"action":  map[string]any{"type": "string", "enum": []any{"search", "open_page", "find_in_page"}},
+			"query":   map[string]any{"type": "string"},
+			"queries": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "maxItems": 4},
+			"url":     map[string]any{"type": "string"},
+			"pattern": map[string]any{"type": "string"},
+		},
+		"required":             []any{"action"},
+		"additionalProperties": false,
+	}
+	fn := map[string]any{"name": upstreamName, "description": description, "parameters": parameters}
+	mapping := responseToolMapping{Kind: responseToolWebSearch, Name: "web_search", UpstreamName: upstreamName, Execution: "server"}
+	return map[string]any{"type": "function", "function": fn}, mapping, options, nil
 }
 
 func convertResponsesToolSearch(tool map[string]any, used map[string]bool) (map[string]any, responseToolMapping, error) {
@@ -473,6 +548,11 @@ func convertResponsesToolChoice(value any, bridge *ResponsesToolBridge, hasTools
 	}
 	if typeName == "tool_search" {
 		if mapping, ok := bridge.responseMapping(responseToolSearch, "", "tool_search"); ok {
+			return map[string]any{"type": "function", "function": map[string]any{"name": mapping.UpstreamName}}
+		}
+	}
+	if typeName == "web_search" || typeName == "web_search_preview" || typeName == "web_search_preview_2025_03_11" {
+		if mapping, ok := bridge.responseMapping(responseToolWebSearch, "", "web_search"); ok {
 			return map[string]any{"type": "function", "function": map[string]any{"name": mapping.UpstreamName}}
 		}
 	}
@@ -609,6 +689,9 @@ func convertResponsesInput(value any, instructions string, bridge *ResponsesTool
 		case "additional_tools":
 			// Definitions are merged into the translated top-level tool list by
 			// collectResponsesTools. No conversational message is needed.
+		case "web_search_call":
+			// Hosted web-search calls are provider execution artifacts. Their useful
+			// information is already reflected in subsequent assistant messages.
 		case "reasoning":
 			// Reasoning items are provider continuity artifacts. TRAE does not
 			// accept encrypted reasoning state, so they are intentionally omitted.
