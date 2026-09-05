@@ -2,6 +2,33 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.1] - 2026-09-05
+
+### Fixed
+
+- Replaced the v0.4.0 hard-coded China/SOLO authorization URL with the current LoginGuidance-based browser-login flow.
+- Changed the default OAuth product from CN/SOLO to standard TRAE Global (`trae.ai`), matching Global IDE installations.
+- Added PKCE S256 (`code_challenge` / `CodeVerifier`) and the current AuthCode ExchangeToken request with P-256 device public-key metadata.
+- Switched the primary local callback to `/authorize` while retaining `/auth/callback/{state}` for v0.4.0 compatibility.
+- Made refresh/user-info/token exchange use the credential's actual platform, login host, client ID and region instead of assuming the old CN/SOLO account service.
+- Made Agent API routing session-aware so Global SG/US and CN credentials use the matching upstream region.
+
+### Added
+
+- `TRAE_OAUTH_PLATFORM`: `global` (default), `global-solo`, `cn`, or `cn-solo`.
+- Global and CN LoginGuidance endpoint sets with configurable `TRAE_OAUTH_GUIDANCE_URLS` overrides.
+- Parsing of current `authCodeInfo` browser callbacks and flexible token/expiry response shapes.
+- Best-effort local TRAE `product.json` discovery for current app version, build/plugin version and TRAE/SOLO auth client ID; `TRAE_APP_PATH` can point to a custom installation.
+- Credential metadata for OAuth platform, login host/region, client ID and effective Agent API base.
+- Offline integration tests for Global LoginGuidance, PKCE authorization, AuthCode exchange, DeviceInfo and installed-product metadata selection.
+
+### Compatibility
+
+- Existing v0.4.0 credential files are migrated in memory; old CN/SOLO credentials retain their original client family.
+- Legacy refreshToken/userJwt browser callbacks remain accepted.
+- Explicit OAuth environment variables continue to override platform defaults and detected product metadata.
+- Static `TRAE_IDE_TOKEN`, existing OpenAI endpoints and SOLO/legacy upstream compatibility are unchanged.
+
 ## [0.4.0] - 2026-09-05
 
 ### Added

@@ -2,21 +2,26 @@
 
 ![Trae API Proxy Banner](assets/banner.png)
 
-一个轻量、单账号、零第三方 Go 依赖的 TRAE → OpenAI Chat Completions 兼容代理。
+一个轻量、单账号、零第三方 Go 运行依赖的 TRAE → OpenAI Chat Completions 兼容代理。
 
-v0.4.0 在 v0.3 的 SOLO / legacy 协议兼容层之上补齐了 **TRAE 登录生命周期**：首次在浏览器完成一次 TRAE 登录后，代理保存 refresh token，自动换取 access token、提前刷新、轮换 refresh token，并在真实上游返回 401/403 时执行一次强制刷新与原请求重试。日常使用不再需要手工维护 `TRAE_IDE_TOKEN`。
+**v0.4.1 修复了 v0.4.0 浏览器登录在 TRAE Global 上失败的问题。** v0.4.0 仍沿用了旧的 China/SOLO 直连授权 URL；当前版本默认面向 `trae.ai` 的标准 TRAE Global 登录，先通过 LoginGuidance 获取实际登录域名，再使用 PKCE S256 完成浏览器授权和 AuthCode 换票。首次登录完成后，代理继续负责 access token 刷新、refresh token 轮换和 401/403 单次自愈重试。
 
-## ✨ v0.4.0 重点
+> 如果你使用的是 TRAE Global IDE，通常只需要保持 `TRAE_OAUTH_PLATFORM=global`，不要再手工指定旧的 `trae.cn`、SOLO client id 或 v0.4.0 登录 URL。
 
-- **浏览器首次登录**：访问 `http://127.0.0.1:8000/auth/login`，登录成功后凭证自动写入本地。
-- **自动续期**：默认在 access token 到期前 24 小时刷新，每 15 分钟检查一次。
-- **refresh token 轮换**：ExchangeToken 返回新 refresh token 时与 access token 一起原子落盘。
-- **401/403 自愈**：OAuth 会话请求上游遇到鉴权失败时，强制刷新一次并仅重试原请求一次。
-- **并发刷新去重**：多个请求同时发现 Token 需要刷新时，只允许一个 refresh 流程真正执行。
-- **安全凭证文件**：默认 `./data/trae-auth.json`，目录 `0700`、文件 `0600`，不写入 Git/Docker build context。
-- **兼容旧配置**：`TRAE_IDE_TOKEN` 仍可作为静态模式或 `auto` 模式 fallback。
-- **Docker 持久化**：Compose 使用命名卷保存 `/app/data`，重建容器不会丢登录状态。
-- **SOLO + legacy**：继续支持 `/api/agent/v3/llm_utils_chat` / `solo_work_lite`，并在 `auto` 模式下对 404/405 回退旧接口。
+## ✨ v0.4.1 重点
+
+- **Global TRAE 默认模式**：默认 `TRAE_OAUTH_PLATFORM=global`，标准 TRAE 使用 Global 登录与账号接口。
+- **LoginGuidance**：`/auth/login` 不再硬编码旧授权域名，而是先获取当前可用 LoginHost。
+- **PKCE S256**：授权 URL 包含 `code_challenge` / `code_challenge_method=S256`，本地保存一次性 verifier 用于换票。
+- **当前 AuthCode 流程**：回调默认使用 `http://127.0.0.1:18080/authorize`，支持 `authCodeInfo/AuthCode` 后再 ExchangeToken。
+- **多平台兼容**：`global`、`global-solo`、`cn`、`cn-solo` 四种认证平台可选。
+- **本机 IDE 元数据发现**：同机安装 TRAE 时，优先从 `product.json` 获取 appVersion、tronBuildVersion 和匹配产品的 auth client id；环境变量仍拥有最高优先级。
+- **区域化上游**：托管凭证记录登录区域，Global SG/US 与 CN 会选择对应 Agent API host。
+- **自动续期**：默认 access token 到期前 24 小时刷新，每 15 分钟检查一次。
+- **refresh token 轮换**：换票返回新 refresh token 时与 access token 一起原子落盘。
+- **401/403 自愈**：OAuth 会话真实请求遇到鉴权失败时，强制刷新一次并仅重试原请求一次。
+- **兼容 v0.4.0**：旧 refreshToken/userJwt callback 与 v1 凭证文件仍可迁移；旧 CN/SOLO 凭证会按原产品推断。
+- **兼容静态 Token**：`TRAE_IDE_TOKEN` 仍可作为静态模式或 `auto` fallback。
 - **OpenAI 兼容**：模型列表、流式/非流式 Chat Completions、reasoning、usage、tools / tool_choice / tool_calls。
 
 > 项目仍保持“轻量单账号代理”的定位；多账号池、账号运营后台、签到/额度管理不在当前范围内。
@@ -24,30 +29,37 @@ v0.4.0 在 v0.3 的 SOLO / legacy 协议兼容层之上补齐了 **TRAE 登录�
 ## 🏗️ 调用链
 
 ```text
-首次登录：
-Browser → :8000/auth/login → TRAE 登录 → :18080/auth/callback/{state}
-                                  ↓
-                           refresh token
-                                  ↓
-                           ExchangeToken
-                                  ↓
-                    access + refresh + expiry
-                                  ↓
-                       data/trae-auth.json
+首次登录（Global 默认）：
+Browser → :8000/auth/login
+              ↓
+        GetLoginGuidance
+              ↓
+trae.ai /authorization + PKCE
+              ↓
+        :18080/authorize
+              ↓
+      AuthCode + CodeVerifier
+              ↓
+         ExchangeToken
+              ↓
+ access + refresh + expiry + region
+              ↓
+      data/trae-auth.json
 
 日常请求：
-OpenAI Client → trae-api-proxy → AuthManager → TRAE SOLO
+OpenAI Client → trae-api-proxy → AuthManager → TRAE Agent API
                                   │
                                   ├─ 到期前：自动 refresh
-                                  └─ 401/403：refresh + retry once
+                                  ├─ 401/403：refresh + retry once
+                                  └─ SG / US / CN：按会话区域路由
 ```
 
-## 🚀 快速开始：推荐的无感登录模式
+## 🚀 快速开始：TRAE Global 推荐配置
 
 ### 环境
 
-- 最低：Go 1.23+
-- CI 同时覆盖 Go 1.23 与当前 Go 1.27 工具链
+- Go 1.23+
+- CI 同时覆盖 Go 1.23 与当前 Go 工具链
 
 ### 1. 配置
 
@@ -55,7 +67,7 @@ OpenAI Client → trae-api-proxy → AuthManager → TRAE SOLO
 cp .env.example .env
 ```
 
-本地使用最少只需要改：
+本地 Global TRAE 最少建议：
 
 ```dotenv
 BIND=127.0.0.1
@@ -64,11 +76,24 @@ AUTH_TOKEN=my-local-proxy-key
 
 TRAE_AUTH_MODE=auto
 TRAE_AUTH_FILE=./data/trae-auth.json
+TRAE_OAUTH_PLATFORM=global
 TRAE_IDE_TOKEN=
 TRAE_OAUTH_CALLBACK_PORT=18080
 ```
 
-`AUTH_TOKEN` 是给 OpenAI 客户端使用的本地代理 key，与 TRAE 会话完全分离。
+`AUTH_TOKEN` 是 OpenAI 客户端访问这个代理使用的本地 key，与 TRAE 登录凭证完全分离。
+
+如果你从 v0.4.0 升级，而且 `.env` 里曾手工加入这些旧值：
+
+```dotenv
+TRAE_OAUTH_HOST=https://api.trae.com.cn
+TRAE_OAUTH_CONSOLE_URL=https://www.trae.cn/authorization
+TRAE_OAUTH_CLIENT_ID=en1oxy7wnw8j9n
+TRAE_OAUTH_PLUGIN_VERSION=2.3.62834
+TRAE_IDE_VERSION=0.1.52
+```
+
+**Global 用户应删除这些覆盖项，或改用新版 `.env.example`。** 否则环境变量优先级会主动覆盖 v0.4.1 的 Global/自动发现逻辑。
 
 ### 2. 启动
 
@@ -91,16 +116,16 @@ make check
 http://127.0.0.1:8000/auth/login
 ```
 
-浏览器会跳转到 TRAE 登录页面。主 API 仍在 `8000`；代理会另外在本机 `127.0.0.1:18080` 启动一个仅用于 OAuth callback 的 listener。正常完成登录后，TRAE 回调该 listener，代理自动：
+Global 标准 TRAE 正常情况下会：
 
-1. 接收一次性登录回调；
-2. 取得 refresh token；
-3. ExchangeToken 获取 access token；
-4. 获取账号 UID；
-5. 保存 `data/trae-auth.json`；
-6. 开启自动刷新。
+1. 代理向 Global LoginGuidance 获取当前 LoginHost；
+2. 浏览器跳转到 `trae.ai` 体系的 `/authorization`；
+3. URL 中包含 `auth_from=trae`、PKCE `code_challenge` 和 `code_challenge_method=S256`；
+4. TRAE 完成登录后回调 `http://127.0.0.1:18080/authorize`；
+5. 代理用 AuthCode + CodeVerifier + DeviceInfo 换取会话；
+6. 自动保存 `data/trae-auth.json` 并开始自动刷新。
 
-无需把 access token / refresh token 复制到 `.env`。
+如果同机安装了 TRAE IDE，代理会尝试读取其 `product.json`，以跟随当前安装版本的 `appVersion`、`tronBuildVersion` 与 auth client id。可用 `TRAE_APP_PATH` 指定安装目录或 `product.json`；显式环境变量仍然优先。
 
 ### 4. 确认登录状态
 
@@ -109,7 +134,7 @@ curl http://127.0.0.1:8000/auth/status \
   -H 'Authorization: Bearer my-local-proxy-key'
 ```
 
-返回只包含安全状态，例如：
+正常会看到类似：
 
 ```json
 {
@@ -119,24 +144,37 @@ curl http://127.0.0.1:8000/auth/status \
   "refreshable": true,
   "auto_refresh": true,
   "needs_refresh": false,
+  "platform": "global",
+  "login_region": "sg",
   "uid": "...",
   "expires_at": 1788600000,
   "refresh_expires_at": 1800000000
 }
 ```
 
-接口和日志不会返回真实 access token / refresh token。
+不会返回真实 access token / refresh token。
+
+## 🌍 认证平台
+
+| `TRAE_OAUTH_PLATFORM` | 用途 | 默认 auth_from | 默认区域 |
+|---|---|---|---|
+| `global` | 标准 TRAE Global / `trae.ai` | `trae` | Global / SG |
+| `global-solo` | TRAE SOLO Global | `solo` | Global / SG |
+| `cn` | 标准 TRAE China / `trae.cn` | `trae` | CN |
+| `cn-solo` | TRAE SOLO China | `solo` | CN |
+
+默认是 `global`。Global 登录后如服务返回 US/USTTP 区域，后续 Agent API 可切到 US；CN 登录使用 CN Agent API。
+
+高级用户可以覆盖 `TRAE_OAUTH_HOST`、`TRAE_OAUTH_CONSOLE_URL`、`TRAE_OAUTH_CLIENT_ID`、`TRAE_OAUTH_GUIDANCE_URLS` 和 ExchangeToken/UserInfo 路径，但一般不建议覆盖。
 
 ## 🔄 自动续期逻辑
-
-默认策略：
 
 ```text
 access token 剩余 > 24h
     → 直接使用
 
 access token 剩余 <= 24h
-    → ExchangeToken
+    → ExchangeToken(refresh token)
     → 保存新的 access token
     → 如果返回新 refresh token，同时轮换保存
 
@@ -150,16 +188,14 @@ refresh token 已过期 / 被撤销
     → 再访问 /auth/login 完成一次网页登录
 ```
 
-并发请求不会重复消费同一个 refresh token；刷新操作有独立互斥锁并会在拿锁后重新检查凭证状态。
-
-手工触发一次刷新：
+手工刷新：
 
 ```bash
 curl -X POST http://127.0.0.1:8000/auth/refresh \
   -H 'Authorization: Bearer my-local-proxy-key'
 ```
 
-退出并删除本地 OAuth 凭证：
+退出并删除本地托管凭证：
 
 ```bash
 curl -X POST http://127.0.0.1:8000/auth/logout \
@@ -180,7 +216,7 @@ TRAE_IDE_TOKEN
 请求中的 Bearer / X-API-Key
 ```
 
-如果设置了 `AUTH_TOKEN`，客户端提供的 Bearer 是本地代理 key，不会被误当成 TRAE Token；因此推荐同时使用浏览器 OAuth 或静态 `TRAE_IDE_TOKEN`。
+如果设置了 `AUTH_TOKEN`，客户端 Bearer 是本地代理 key，不会被误当成 TRAE Token。
 
 ### `TRAE_AUTH_MODE=oauth`
 
@@ -188,7 +224,7 @@ TRAE_IDE_TOKEN
 
 ### `TRAE_AUTH_MODE=token`
 
-完全兼容旧版：
+静态 Token 兼容模式：
 
 ```dotenv
 TRAE_AUTH_MODE=token
@@ -202,7 +238,7 @@ TRAE_MACHINE_ID=
 
 ### `TRAE_AUTH_MODE=passthrough`
 
-客户端请求中的 Bearer Token / `X-API-Key` 直接作为 TRAE Token，适合明确需要请求级凭证的场景。
+客户端请求中的 Bearer Token / `X-API-Key` 直接作为 TRAE Token。
 
 ## 🔗 API
 
@@ -212,7 +248,8 @@ TRAE_MACHINE_ID=
 | `GET` | `/status` | 服务 + 安全认证状态 |
 | `GET` | `/auth/status` | OAuth 生命周期状态 |
 | `GET` | `/auth/login` | 从 localhost 发起 TRAE 浏览器登录 |
-| `GET` | `/auth/callback/{state}` | 一次性 TRAE 登录回调 |
+| `GET` | `/authorize` | 当前 TRAE 本机 OAuth callback |
+| `GET` | `/auth/callback/{state}` | v0.4.0 兼容 callback |
 | `POST` | `/auth/refresh` | 手工强制刷新一次 |
 | `POST` | `/auth/logout` | 删除本地托管凭证 |
 | `GET` | `/v1/models` | OpenAI-compatible 模型列表 |
@@ -275,22 +312,22 @@ TRAE_MODEL_ALIASES=sonnet=glm-5.2;fast=glm-5-turbo
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `BIND` | `0.0.0.0` | HTTP 监听地址；`.env.example` 为本地安全起见预设 `127.0.0.1` |
+| `BIND` | `0.0.0.0` | HTTP 监听地址；`.env.example` 预设 `127.0.0.1` |
 | `PORT` | `8000` | HTTP 端口 |
 | `AUTH_TOKEN` | 空 | 客户端访问代理的本地 key |
 | `TRAE_AUTH_MODE` | `auto` | `auto` / `oauth` / `token` / `passthrough` |
 | `TRAE_AUTH_FILE` | `./data/trae-auth.json` | 托管 OAuth 凭证 |
-| `TRAE_IDE_TOKEN` | 空 | 兼容静态 Token / auto fallback |
-| `TRAE_OAUTH_CALLBACK_PORT` | `18080` | 本机 OAuth callback listener 端口 |
-| `TRAE_OAUTH_CALLBACK_BASE_URL` | 空（自动派生 `http://127.0.0.1:18080`） | 高级自定义回调基址 |
-| `TRAE_OAUTH_CALLBACK_BIND` | 空 | callback listener 绑定地址；Compose 内部覆盖为 `0.0.0.0` |
+| `TRAE_OAUTH_PLATFORM` | `global` | `global` / `global-solo` / `cn` / `cn-solo` |
+| `TRAE_IDE_TOKEN` | 空 | 静态 Token / auto fallback |
+| `TRAE_APP_PATH` | 空 | 可选安装目录或 `product.json`，用于发现 IDE 产品参数 |
+| `TRAE_OAUTH_CALLBACK_PORT` | `18080` | 本机 OAuth callback listener |
+| `TRAE_OAUTH_CALLBACK_BASE_URL` | 自动 `http://127.0.0.1:18080` | 高级回调基址 |
 | `TRAE_OAUTH_REFRESH_SKEW` | `24h` | 提前多久刷新 access token |
 | `TRAE_OAUTH_REFRESH_INTERVAL` | `15m` | 后台检查间隔 |
-| `TRAE_OAUTH_LOGIN_TTL` | `10m` | 一次性登录 state 有效期 |
+| `TRAE_OAUTH_LOGIN_TTL` | `10m` | 一次性登录会话有效期 |
 | `TRAE_UPSTREAM_MODE` | `auto` | `auto` / `solo` / `legacy` |
-| `TRAE_API_BASE_URL` | `https://trae-api-cn.mchost.guru` | TRAE Agent host |
+| `TRAE_API_BASE_URL` | Global: `https://trae-api-sg.mchost.guru` | OAuth 会话可按区域动态选择 SG/US/CN |
 | `TRAE_DEFAULT_MODEL` | `glm-5.2` | 默认模型 |
-| `TRAE_MODEL_ALIASES` | 空 | `alias=model` 列表 |
 | `TRAE_MODEL_CACHE_TTL` | `1h` | 模型列表缓存 |
 | `TRAE_REQUEST_TIMEOUT` | `120s` | 短 JSON 请求总超时 |
 | `TRAE_RESPONSE_HEADER_TIMEOUT` | `120s` | 上游首包/响应头超时 |
@@ -298,13 +335,13 @@ TRAE_MODEL_ALIASES=sonnet=glm-5.2;fast=glm-5-turbo
 | `SHUTDOWN_TIMEOUT` | `10s` | 优雅退出等待时间 |
 | `CORS_ALLOW_ORIGIN` | 空 | 留空关闭 CORS |
 
-OAuth host、Client ID、ExchangeToken/UserInfo 路径等兼容参数也都可在 `.env.example` 中覆盖，方便上游协议再次变化时无需改代码。
+完整高级配置见 `.env.example`。
 
 ## 🐳 Docker
 
 ```bash
 cp .env.example .env
-# 编辑 AUTH_TOKEN 等配置
+# 编辑 AUTH_TOKEN；Global 用户保持 TRAE_OAUTH_PLATFORM=global
 
 docker compose up -d --build
 ```
@@ -313,7 +350,6 @@ Compose 默认：
 
 - 主 API 只映射宿主机 `127.0.0.1:${PORT}`；
 - OAuth callback 只映射宿主机 `127.0.0.1:${TRAE_OAUTH_CALLBACK_PORT:-18080}`；
-- 容器内主 API 和 callback listener 分别监听容器端口；callback URL 对浏览器仍是宿主机 `127.0.0.1:18080`；
 - 用命名卷 `trae-api-data` 持久化 `/app/data`；
 - 重建/升级容器后仍保留 OAuth 登录状态。
 
@@ -323,13 +359,13 @@ Compose 默认：
 http://127.0.0.1:8000/auth/login
 ```
 
-停止服务不会删除凭证：
+停止但保留凭证：
 
 ```bash
 docker compose down
 ```
 
-如果明确要连凭证卷一起删除：
+删除容器和凭证卷：
 
 ```bash
 docker compose down -v
@@ -345,49 +381,83 @@ make build
 make check
 ```
 
-离线测试全部使用 `httptest`，不需要真实 TRAE 账号，覆盖：
+离线测试使用本地 mock / `httptest`，不需要真实 TRAE 账号，覆盖：
 
-- OAuth callback → ExchangeToken → UserInfo → `0600` 持久化
-- access/refresh token 轮换
-- 过期前主动刷新
-- 并发刷新去重
-- 刷新失败时有效旧 Token 的容错
+- LoginGuidance → PKCE 授权 URL
+- Global 标准 TRAE `auth_from=trae`
+- `authCodeInfo` → AuthCode ExchangeToken + P-256 DeviceInfo
+- 旧 refreshToken/userJwt callback 兼容
+- `product.json` 的 TRAE/SOLO client id 与版本解析
+- access/refresh token 轮换、持久化与凭证迁移
+- 过期前主动刷新与并发刷新去重
 - refresh token 失效后的 `reauth_required`
-- 上游 401 → 强制刷新 → 原 chat 请求只重试一次
-- OAuth UID / machine ID / device ID 注入上游请求
-- `/auth/status` 不泄漏 access / refresh token
+- 上游 401 → 强制刷新 → 原请求只重试一次
+- OAuth UID / machine ID / device ID / API region 注入
 - SOLO payload、tools / tool_choice、SSE、usage
 - SOLO → legacy 自动回退
 - 动态模型列表与缓存
 - 本地 `AUTH_TOKEN` 与上游凭证隔离
-- dotenv 配置解析
 
-## ⬆️ 从 v0.3.0 升级
+## ⬆️ 从 v0.4.0 升级到 v0.4.1
 
-1. 保留原 `.env`，新增 `TRAE_AUTH_MODE=auto` 与 `TRAE_AUTH_FILE=./data/trae-auth.json`。
-2. 如果想继续静态 Token，什么都不必迁移：原 `TRAE_IDE_TOKEN` 会作为 `auto` fallback；也可以显式设 `TRAE_AUTH_MODE=token`。
-3. 要启用无感续期，确保本机 `18080` 未被占用（或调整 `TRAE_OAUTH_CALLBACK_PORT`），启动后访问 `/auth/login` 完成一次网页登录。
-4. 登录成功后可删除 `.env` 里的 `TRAE_IDE_TOKEN`；托管凭证会保存在 `data/trae-auth.json`。
-5. Docker 用户升级 Compose 后会使用持久化卷；首次升级需要重新网页登录一次以把凭证写入卷。
+如果你在 v0.4.0 上遇到 `www.trae.cn/authorization` 打开后提示“登录失败 / 网络错误”，而实际 IDE 使用的是 `trae.ai`，这是 v0.4.1 重点修复的问题。
+
+1. 保留你的原 `.env` 和静态 `TRAE_IDE_TOKEN` 备份。
+2. 增加或确认：
+
+   ```dotenv
+   TRAE_OAUTH_PLATFORM=global
+   ```
+
+3. **删除 v0.4.0 手工加入的旧 CN/SOLO OAuth 覆盖项**，特别是 `TRAE_OAUTH_HOST`、`TRAE_OAUTH_CONSOLE_URL`、`TRAE_OAUTH_CLIENT_ID`、`TRAE_OAUTH_PLUGIN_VERSION`、`TRAE_IDE_VERSION`，除非你明确知道需要覆盖。
+4. 可删除旧的 `data/trae-auth.json`，或调用 `/auth/logout` 后重新登录。v0.4.1 也会尽量迁移旧凭证，但一次干净登录最容易验证新链路。
+5. 启动后访问 `/auth/login`。Global 标准 TRAE 的新授权 URL 应属于 `trae.ai` 体系，且包含 PKCE；不应再被固定成 `trae.cn + auth_from=solo`。
+6. 登录完成后用 `/auth/status` 确认 `authenticated=true`、`platform=global`，再测试 `/v1/models` 和 `/v1/chat/completions`。
+
+## 🔧 登录排障
+
+### 仍然跳到 `trae.cn` 或 `auth_from=solo`
+
+先检查 `.env` 是否保留了 v0.4.0 的覆盖值：
+
+```bash
+grep -E 'TRAE_OAUTH_(PLATFORM|HOST|CONSOLE_URL|CLIENT_ID)|TRAE_IDE_VERSION|TRAE_OAUTH_PLUGIN_VERSION' .env
+```
+
+Global 标准 TRAE 最重要的是：
+
+```dotenv
+TRAE_OAUTH_PLATFORM=global
+```
+
+其他 OAuth host/client/version 建议先留空，让平台默认值和本机 `product.json` 自动发现生效。
+
+### `/auth/login` 返回 LoginGuidance 错误
+
+这发生在浏览器跳转之前，通常是本机网络/DNS/代理无法访问 Global account API，或上游登录域名发生变化。不要把 LoginGuidance 失败强行改回旧 `trae.cn/authorization`；先检查网络与日志。
+
+### 浏览器登录成功但 callback 无法连接
+
+确认本机 `18080` 未被占用，且启动日志显示 callback listener 已监听；Docker 用户确认 Compose 同时发布了 `127.0.0.1:18080`。
 
 ## 🔎 公开实现参考
 
-认证和上游兼容实现对照了以下公开项目，本仓库仍保持自己的轻量单账号定位：
+认证和上游兼容实现对照了以下公开项目与当前实现，本仓库仍保持自己的轻量单账号定位：
 
-- [Sliverkiss/traework2api](https://github.com/Sliverkiss/traework2api) — browser login、refreshToken、ExchangeToken、凭证轮换与 SOLO upstream。
+- [Sliverkiss/traework2api](https://github.com/Sliverkiss/traework2api) — refreshToken、ExchangeToken、凭证轮换与 SOLO upstream。
 - [connectedGraph/trae2api-web](https://github.com/connectedGraph/trae2api-web) — Web 登录闭环、账号热加载、动态模型和工程化参考。
-- [wanlibeiqiu/local-proxy](https://github.com/wanlibeiqiu/local-proxy) — SSE、模型映射和本地 key 隔离的代理设计参考。
+- [wanlibeiqiu/local-proxy](https://github.com/wanlibeiqiu/local-proxy) — SSE、模型映射和本地 key 隔离参考。
 
 ## 📂 目录
 
 ```text
 .
 ├── cmd/trae-api/              # 服务入口
-├── internal/auth/             # 浏览器登录 / 凭证 / 自动刷新
-├── internal/config/           # 配置与校验
+├── internal/auth/             # LoginGuidance / PKCE / 凭证 / 自动刷新
+├── internal/config/           # 平台路由 / product.json 发现 / 配置
 ├── internal/handler/          # HTTP API / 鉴权 / 错误映射
 ├── internal/middleware/       # request ID / CORS / 日志 / recovery
-├── internal/service/trae/     # SOLO + legacy upstream / SSE / payload
+├── internal/service/trae/     # Agent upstream / SSE / payload
 ├── pkg/utils/                 # dotenv 工具
 ├── data/                      # 本地 OAuth 凭证（Git ignored）
 ├── .github/workflows/ci.yml
@@ -400,8 +470,8 @@ make check
 ## ⚠️ 兼容边界
 
 - 当前专注 Chat Completions，不实现 embeddings、images、audio、OpenAI Responses API 或多账号池。
-- access token 可以自动刷新，但 refresh token 本身仍可能过期、被撤销或因账号状态变化失效；此时需要重新访问 `/auth/login`。
-- OAuth/Agent 上游并非公开稳定 API。所有 host、Client ID、路径和客户端指纹均做成可配置项，以降低后续协议漂移的维护成本。
+- access token 可以自动刷新，但 refresh token 自身仍可能过期、被撤销或因账号状态变化失效；此时需要重新访问 `/auth/login`。
+- TRAE 登录/Agent 上游并非公开稳定 API。v0.4.1 已把区域、产品、LoginGuidance、Client ID、路径和客户端版本尽可能动态化/可配置，但后续仍可能随 IDE 更新调整。
 
 ## 📄 License
 

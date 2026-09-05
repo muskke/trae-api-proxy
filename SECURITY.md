@@ -7,11 +7,13 @@
 - Credential directories are created with mode `0700` and credential files with mode `0600` where the operating system supports POSIX permissions.
 - Access/refresh tokens are never returned by `/status` or `/auth/status` and are not written to normal request logs.
 - OAuth provider error bodies are not copied into public errors/status, reducing the chance of session metadata being echoed into logs.
+- Browser login uses PKCE S256 and one-time in-memory login state; the PKCE verifier is never exposed through status endpoints.
 
 ## Network exposure
 
 - Prefer `BIND=127.0.0.1` for personal use.
 - `/auth/login` is intentionally limited to local/loopback browser flows. Docker localhost publishing is supported through a private bridge peer plus loopback Host check.
+- The current TRAE callback is served on local `/authorize` (default `127.0.0.1:18080`); the legacy state callback remains only for compatibility.
 - If binding the API to `0.0.0.0`, configure a strong `AUTH_TOKEN` and use an appropriate firewall/reverse proxy.
 - Docker Compose publishes the service only on host `127.0.0.1` by default.
 - `AUTH_TOKEN` protects client API/lifecycle endpoints but is separate from TRAE access/refresh credentials.
