@@ -4,11 +4,16 @@
 
 一个轻量、单账号、零第三方 Go 运行依赖的 TRAE → OpenAI Chat Completions 兼容代理。
 
-**v0.4.3 在已打通的 Global OAuth / SG `chat_v3` 链路上增加了“当前账号模型可用性”学习层。** v0.4.0 仍沿用了旧的 China/SOLO 直连授权 URL；当前版本默认面向 `trae.ai` 的标准 TRAE Global 登录，先通过 LoginGuidance 获取实际登录域名，再使用 PKCE S256 完成浏览器授权和 AuthCode 换票。首次登录完成后，代理继续负责 access token 刷新、refresh token 轮换和 401/403 单次自愈重试。
+**v0.4.4 是针对真实 Global SG 长连接测试做的稳定性收尾版。** 在 v0.4.3 的模型可用性学习基础上，它修复了 `progress_notice` 等辅助 SSE 事件可能中断输出的问题，把模型状态持久化到 `data/model-status.json`，增加 reasoning 输出兼容模式，并让启动日志与 `/status` 显示真实会话上游，而不是旧配置占位值。
 
 > 如果你使用的是 TRAE Global IDE，通常只需要保持 `TRAE_OAUTH_PLATFORM=global`，不要再手工指定旧的 `trae.cn`、SOLO client id 或 v0.4.0 登录 URL。
 
-## ✨ v0.4.3 重点
+## ✨ v0.4.4 重点
+
+- **SSE 辅助事件容错**：`progress_notice`、heartbeat、未来未知事件即使携带 string/null/非 JSON 数据，也不会再把正常聊天流打断；只有真正需要对象结构的核心事件才严格解析。
+- **模型状态跨重启持久化**：`usable` / `unavailable` 学习结果默认原子写入 `data/model-status.json`，重启后继续使用，过期条目自动回到 `unknown`。
+- **Reasoning 兼容模式**：`TRAE_REASONING_MODE=preserve|merge|drop`，可兼容支持 `reasoning_content` 的新客户端和只认 `delta.content` 的旧客户端。
+- **真实上游诊断**：启动日志与 `/status` 直接展示当前 OAuth 会话的 chat upstream / region / platform / function / OAuth host，避免日志仍显示旧默认值而实际请求已走 Global Core host。
 
 - **模型可用性学习**：模型目录中的条目先是 `unknown`；真实成功调用记为 `usable`；最小标准请求明确返回 TRAE `4001` 时暂记为 `unavailable`。
 - **默认模型列表去坑**：`GET /v1/models` 默认隐藏当前账号负缓存中的模型，同时保留尚未验证的 `unknown` 模型；可用 `availability=` 查询不同视图。
@@ -297,7 +302,25 @@ curl -X DELETE 'http://127.0.0.1:8000/v1/models/status?model=DeepSeek-V4-Flash' 
   -H 'Authorization: Bearer my-local-proxy-key'
 ```
 
-> v0.4.3 不会在启动时逐模型主动探测，因此不会为了“验证列表”自动消耗额度。`unknown` 只有在真实请求成功/明确失败后才会变成 `usable` / `unavailable`。
+> v0.4.4 仍不会在启动时逐模型主动探测，因此不会为了“验证列表”自动消耗额度。`unknown` 只有在真实请求成功/明确失败后才会变成 `usable` / `unavailable`；学习结果会持久化到本地状态文件并受 TTL 控制。
+
+### Reasoning 输出兼容
+
+默认保持 TRAE 的独立思考字段：
+
+```dotenv
+TRAE_REASONING_MODE=preserve
+```
+
+三种模式：
+
+| 模式 | 行为 | 适用客户端 |
+|---|---|---|
+| `preserve` | `reasoning_content` 与最终 `content` 分开输出 | 支持推理字段的新客户端 |
+| `merge` | 把 reasoning token 合并到 `content` | 只读取 OpenAI 标准 `content` 的旧客户端 |
+| `drop` | 丢弃 reasoning，仅输出最终答案 | 不希望接收思考流的客户端 |
+
+聊天响应会带 `X-Trae-Reasoning-Mode` 便于诊断。
 
 ### 非流式对话
 
@@ -390,6 +413,8 @@ TRAE_MODEL_ALIASES=sonnet=glm-5.2;fast=glm-5-turbo
 | `TRAE_MODEL_CACHE_TTL` | `1h` | 上游模型目录缓存 |
 | `TRAE_MODEL_FAILURE_TTL` | `30m` | 最小请求 `4001` 的模型负缓存时间 |
 | `TRAE_MODEL_SUCCESS_TTL` | `6h` | 成功调用模型的正缓存时间 |
+| `TRAE_MODEL_STATUS_FILE` | `./data/model-status.json` | 持久化当前账号模型能力状态；与 OAuth 凭证同属本地 `data/` |
+| `TRAE_REASONING_MODE` | `preserve` | `preserve` / `merge` / `drop` reasoning 输出策略 |
 | `TRAE_REQUEST_TIMEOUT` | `120s` | 短 JSON 请求总超时 |
 | `TRAE_RESPONSE_HEADER_TIMEOUT` | `120s` | 上游首包/响应头超时 |
 | `MAX_BODY_BYTES` | `8388608` | 请求体上限（8 MiB） |
@@ -455,13 +480,41 @@ make check
 - 上游 401 → 强制刷新 → 原请求只重试一次
 - OAuth UID / machine ID / device ID / API region 注入
 - SOLO payload、tools / tool_choice、SSE、usage
+- `progress_notice` / heartbeat / 未知辅助 SSE 事件容错
+- reasoning `preserve` / `merge` / `drop` 转换
 - SOLO → legacy 自动回退
-- 动态模型列表、账号隔离缓存与模型能力状态学习
+- 动态模型列表、账号隔离缓存、模型能力状态学习与状态文件重载
 - 本地 `AUTH_TOKEN` 与上游凭证隔离
+
+## ⬆️ 从 v0.4.3 升级到 v0.4.4
+
+不需要重新登录 TRAE，也不需要修改 `data/trae-auth.json`。保留原 `.env` 与凭证，更新代码后重启即可。
+
+首次运行 v0.4.4 时会创建：
+
+```text
+data/model-status.json
+```
+
+它只保存短期模型可用性状态、错误码和 TTL，不保存 prompt、access token 或 refresh token。默认 `preserve` 保持与 v0.4.3 相同的 reasoning 输出语义；只有显式设置 `TRAE_REASONING_MODE=merge` / `drop` 才会改变客户端看到的字段。
+
+升级后建议看启动日志确认实际路由，例如 Global SG 应显示类似：
+
+```text
+platform=global region=sg function=chat_v3 chat_upstream=https://coresg-normal.trae.ai
+```
+
+如果曾经出现：
+
+```text
+decode upstream SSE "progress_notice": json: cannot unmarshal string into Go value of type map[string]interface {}
+```
+
+v0.4.4 会把该类辅助事件安全忽略并继续转换后续 `output` / `done`，不再造成 HTTP 200 但 body 为 0 的假成功。
 
 ## ⬆️ 从 v0.4.2 升级到 v0.4.3
 
-不需要重新登录 TRAE，也不需要修改 `data/trae-auth.json`。保留原 `.env` 和凭证，更新代码后重启即可。新增的模型能力状态只存在内存中，因此升级后的初始状态都是 `unknown`；随着真实调用会自动学习。
+不需要重新登录 TRAE，也不需要修改 `data/trae-auth.json`。保留原 `.env` 和凭证，更新代码后重启即可。v0.4.3 的模型能力状态最初只存在内存中；升级到 v0.4.4 后会自动使用持久化状态文件。
 
 建议升级后依次验证：
 
@@ -536,7 +589,7 @@ TRAE_OAUTH_PLATFORM=global
 ├── internal/middleware/       # request ID / CORS / 日志 / recovery
 ├── internal/service/trae/     # Agent upstream / SSE / payload
 ├── pkg/utils/                 # dotenv 工具
-├── data/                      # 本地 OAuth 凭证（Git ignored）
+├── data/                      # OAuth 凭证 + 模型状态（Git ignored）
 ├── .github/workflows/ci.yml
 ├── Dockerfile
 ├── docker-compose.yml
@@ -567,4 +620,4 @@ After upgrading from v0.4.1, a new browser login is not required. Restart the pr
 
 TRAE 的 `get_detail_param` 目录可能包含当前账号、订阅、产品或区域并不能实际调用的模型，因此“出现在 `/v1/models`”不再被视为已验证可用。v0.4.3 使用被动学习而不是启动时主动探测：最小标准 Chat Completions 成功后记为 `usable`；相同最小形态收到明确的 TRAE `4001` 后短期记为 `unavailable`；额外参数导致的失败不会自动拉黑模型。
 
-默认 `/v1/models` 使用 `availability=available`（`unknown + usable`），负缓存模型会暂时隐藏。`availability=usable` 可得到当前进程中已经真实成功过的模型集合，`availability=all` 可查看完整目录。能力状态是短期内存缓存，不包含 access/refresh token；重启后重新从 `unknown` 学习。
+默认 `/v1/models` 使用 `availability=available`（`unknown + usable`），负缓存模型会暂时隐藏。`availability=usable` 可得到已经真实成功过的模型集合，`availability=all` 可查看完整目录。v0.4.4 起能力状态默认写入 `data/model-status.json`，重启后继续使用未过期状态，仍不包含 access/refresh token 或 prompt。

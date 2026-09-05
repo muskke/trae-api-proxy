@@ -2,6 +2,25 @@
 
 All notable changes to this project are documented here.
 
+## v0.4.4
+
+### Fixed
+
+- Ignore `progress_notice`, heartbeat, and unknown auxiliary TRAE SSE events without requiring them to decode as JSON objects. This prevents valid completions from ending early when auxiliary events carry strings, `null`, or future payload shapes.
+- Make startup diagnostics and `/status` report the effective OAuth-session Agent API host instead of the stale configured fallback host.
+
+### Added
+
+- Persistent per-account model availability state in `TRAE_MODEL_STATUS_FILE` (default `./data/model-status.json`) using private permissions and atomic replacement. Unexpired `usable` / `unavailable` entries survive process and container restarts.
+- `TRAE_REASONING_MODE=preserve|merge|drop` for clients with different reasoning-field support.
+- `X-Trae-Reasoning-Mode` response diagnostics.
+- Regression coverage for string-valued `progress_notice`, unknown malformed auxiliary events, reasoning modes, and model-status reload/reset across client restarts.
+
+### Changed
+
+- Expired persisted model entries are discarded on load and return to `unknown` naturally.
+- Docker's existing `/app/data` volume now persists both OAuth credentials and model capability state.
+
 ## v0.4.3
 
 ### Added

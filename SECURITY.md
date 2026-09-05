@@ -8,7 +8,7 @@
 - Access/refresh tokens are never returned by `/status` or `/auth/status` and are not written to normal request logs.
 - OAuth provider error bodies are not copied into public errors/status, reducing the chance of session metadata being echoed into logs.
 - Browser login uses PKCE S256 and one-time in-memory login state; the PKCE verifier is never exposed through status endpoints.
-- Model availability state is account/session-scoped and kept in memory only. `/v1/models/status` exposes model IDs plus bounded upstream error codes/messages, never prompts or TRAE access/refresh credentials; learned state is cleared on logout or process restart.
+- Model availability state is account/session-scoped and persisted at `TRAE_MODEL_STATUS_FILE` (default `data/model-status.json`) with private/atomic local writes. `/v1/models/status` exposes model IDs plus bounded upstream error codes/messages, never prompts or TRAE access/refresh credentials; logout clears learned state.
 
 ## Network exposure
 
@@ -24,8 +24,8 @@
 - Refresh-token rotations are serialized so concurrent requests do not attempt multiple rotations with the same credential.
 - Refreshed credentials are persisted atomically. If persistence fails, the fresh in-memory session can continue temporarily and `/auth/status` exposes the persistence error without exposing tokens.
 - A refresh token can still expire or be revoked. In that case the service reports `reauth_required` and a fresh local browser login is necessary.
-- Treat backups of `data/trae-auth.json` as secrets and do not attach them to issues, logs, or bug reports.
+- Treat backups of `data/trae-auth.json` as secrets. `data/model-status.json` does not contain tokens or prompts, but it can contain account-scoped model IDs and bounded upstream error messages, so keep the whole `data/` directory private by default.
 
 ## Reporting
 
-Please avoid including live account tokens, `.env` files, `data/trae-auth.json`, captured authorization headers, or complete OAuth callback URLs containing `authCodeInfo` in public issues.
+Please avoid including live account tokens, `.env` files, `data/trae-auth.json`, captured authorization headers, complete OAuth callback URLs containing `authCodeInfo`, or an unreviewed copy of the local `data/` directory in public issues.
