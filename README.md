@@ -4,12 +4,17 @@
 
 一个轻量、单账号、零第三方 Go 运行依赖的 TRAE → OpenAI Chat Completions 兼容代理。
 
-**v0.4.2 修复了 v0.4.0 浏览器登录在 TRAE Global 上失败的问题。** v0.4.0 仍沿用了旧的 China/SOLO 直连授权 URL；当前版本默认面向 `trae.ai` 的标准 TRAE Global 登录，先通过 LoginGuidance 获取实际登录域名，再使用 PKCE S256 完成浏览器授权和 AuthCode 换票。首次登录完成后，代理继续负责 access token 刷新、refresh token 轮换和 401/403 单次自愈重试。
+**v0.4.3 在已打通的 Global OAuth / SG `chat_v3` 链路上增加了“当前账号模型可用性”学习层。** v0.4.0 仍沿用了旧的 China/SOLO 直连授权 URL；当前版本默认面向 `trae.ai` 的标准 TRAE Global 登录，先通过 LoginGuidance 获取实际登录域名，再使用 PKCE S256 完成浏览器授权和 AuthCode 换票。首次登录完成后，代理继续负责 access token 刷新、refresh token 轮换和 401/403 单次自愈重试。
 
 > 如果你使用的是 TRAE Global IDE，通常只需要保持 `TRAE_OAUTH_PLATFORM=global`，不要再手工指定旧的 `trae.cn`、SOLO client id 或 v0.4.0 登录 URL。
 
-## ✨ v0.4.2 重点
+## ✨ v0.4.3 重点
 
+- **模型可用性学习**：模型目录中的条目先是 `unknown`；真实成功调用记为 `usable`；最小标准请求明确返回 TRAE `4001` 时暂记为 `unavailable`。
+- **默认模型列表去坑**：`GET /v1/models` 默认隐藏当前账号负缓存中的模型，同时保留尚未验证的 `unknown` 模型；可用 `availability=` 查询不同视图。
+- **模型诊断接口**：`GET /v1/models/status` 查看状态、函数、最后错误与缓存过期时间；`DELETE /v1/models/status?model=...` 可立即清除某个模型状态重新验证。
+- **避免误判**：带 tools、temperature 等额外参数的复杂请求即便收到 `4001`，也不会因此把模型本身拉黑。
+- **会话隔离**：模型目录和能力状态按账号 / 产品 / 上游 host 隔离，切换账号或区域不会串缓存。
 - **Global 对话路由修复**：标准 TRAE 使用 `chat_v3`，只有 `global-solo` / `cn-solo` 使用 `solo_work_lite`。
 - **Global Core Host 修复**：SG 默认 `https://coresg-normal.trae.ai`，US 默认 `https://coreva-normal.trae.ai`，旧 v0.4.1 自动生成的 SG/US host 启动时自动迁移。
 - **真实回调区域优先**：优先采用 callback 的 `userRegion` / `host` 元数据，避免仅靠登录域名推断区域。
@@ -96,7 +101,7 @@ TRAE_OAUTH_PLUGIN_VERSION=2.3.62834
 TRAE_IDE_VERSION=0.1.52
 ```
 
-**Global 用户应删除这些覆盖项，或改用新版 `.env.example`。** 否则环境变量优先级会主动覆盖 v0.4.2 的 Global/自动发现逻辑。
+**Global 用户应删除这些覆盖项，或改用新版 `.env.example`。** 否则环境变量优先级会主动覆盖当前 Global/自动发现逻辑。
 
 ### 2. 启动
 
@@ -255,15 +260,44 @@ TRAE_MACHINE_ID=
 | `GET` | `/auth/callback/{state}` | v0.4.0 兼容 callback |
 | `POST` | `/auth/refresh` | 手工强制刷新一次 |
 | `POST` | `/auth/logout` | 删除本地托管凭证 |
-| `GET` | `/v1/models` | OpenAI-compatible 模型列表 |
+| `GET` | `/v1/models` | OpenAI-compatible 模型列表；支持 `availability=` 过滤 |
+| `GET` | `/v1/models/status` | 当前账号模型能力状态与最近错误 |
+| `DELETE` | `/v1/models/status` | 清除当前账号模型状态；可传 `?model=` |
 | `POST` | `/v1/chat/completions` | OpenAI-compatible Chat Completions |
 
-### 模型列表
+### 模型列表与可用性
+
+默认列表包含 `unknown + usable`，并自动隐藏当前账号最近已经用“最小标准请求”验证为 `unavailable` 的模型：
 
 ```bash
-curl http://127.0.0.1:8000/v1/models \
+curl 'http://127.0.0.1:8000/v1/models' \
   -H 'Authorization: Bearer my-local-proxy-key'
 ```
+
+可按状态查看：
+
+```bash
+# 只看已经真实调用成功过的模型
+curl 'http://127.0.0.1:8000/v1/models?availability=usable' \
+  -H 'Authorization: Bearer my-local-proxy-key'
+
+# 看完整上游目录，包括当前负缓存模型
+curl 'http://127.0.0.1:8000/v1/models?availability=all' \
+  -H 'Authorization: Bearer my-local-proxy-key'
+
+# 看模型状态、最近错误与过期时间
+curl 'http://127.0.0.1:8000/v1/models/status' \
+  -H 'Authorization: Bearer my-local-proxy-key'
+```
+
+如果某模型的权限/区域状态已经变化，可以不等负缓存过期，立即清除并重试：
+
+```bash
+curl -X DELETE 'http://127.0.0.1:8000/v1/models/status?model=DeepSeek-V4-Flash' \
+  -H 'Authorization: Bearer my-local-proxy-key'
+```
+
+> v0.4.3 不会在启动时逐模型主动探测，因此不会为了“验证列表”自动消耗额度。`unknown` 只有在真实请求成功/明确失败后才会变成 `usable` / `unavailable`。
 
 ### 非流式对话
 
@@ -291,6 +325,28 @@ curl -N http://127.0.0.1:8000/v1/chat/completions \
     "stream_options": {"include_usage": true}
   }'
 ```
+
+### Windows Git Bash 中文请求
+
+代理内部按 UTF-8 保留 OpenAI message 文本；但 `Git Bash -> Windows curl.exe` 直接把中文放进命令行参数时，Windows 参数编码可能先把内容改坏。推荐把 JSON 写成 UTF-8 文件并用 `--data-binary`：
+
+```bash
+cat > request.json <<'EOF'
+{
+  "model": "minimax-m3",
+  "messages": [{"role": "user", "content": "用三句话介绍 Go"}],
+  "stream": true,
+  "stream_options": {"include_usage": true}
+}
+EOF
+
+curl.exe -N http://127.0.0.1:8000/v1/chat/completions \
+  -H "Authorization: Bearer my-local-proxy-key" \
+  -H "Content-Type: application/json; charset=utf-8" \
+  --data-binary @request.json
+```
+
+也可以把中文写成 JSON `\uXXXX` 转义，确保 shell 参数本身全是 ASCII。
 
 ## 🧰 Tool Calling
 
@@ -331,7 +387,9 @@ TRAE_MODEL_ALIASES=sonnet=glm-5.2;fast=glm-5-turbo
 | `TRAE_UPSTREAM_MODE` | `auto` | `auto` / `solo` / `legacy` |
 | `TRAE_API_BASE_URL` | Global SG: `https://coresg-normal.trae.ai` | OAuth 会话可按区域动态选择 SG/US/CN；显式自定义值保持优先 |
 | `TRAE_DEFAULT_MODEL` | `glm-5.2` | 默认模型 |
-| `TRAE_MODEL_CACHE_TTL` | `1h` | 模型列表缓存 |
+| `TRAE_MODEL_CACHE_TTL` | `1h` | 上游模型目录缓存 |
+| `TRAE_MODEL_FAILURE_TTL` | `30m` | 最小请求 `4001` 的模型负缓存时间 |
+| `TRAE_MODEL_SUCCESS_TTL` | `6h` | 成功调用模型的正缓存时间 |
 | `TRAE_REQUEST_TIMEOUT` | `120s` | 短 JSON 请求总超时 |
 | `TRAE_RESPONSE_HEADER_TIMEOUT` | `120s` | 上游首包/响应头超时 |
 | `MAX_BODY_BYTES` | `8388608` | 请求体上限（8 MiB） |
@@ -398,8 +456,24 @@ make check
 - OAuth UID / machine ID / device ID / API region 注入
 - SOLO payload、tools / tool_choice、SSE、usage
 - SOLO → legacy 自动回退
-- 动态模型列表与缓存
+- 动态模型列表、账号隔离缓存与模型能力状态学习
 - 本地 `AUTH_TOKEN` 与上游凭证隔离
+
+## ⬆️ 从 v0.4.2 升级到 v0.4.3
+
+不需要重新登录 TRAE，也不需要修改 `data/trae-auth.json`。保留原 `.env` 和凭证，更新代码后重启即可。新增的模型能力状态只存在内存中，因此升级后的初始状态都是 `unknown`；随着真实调用会自动学习。
+
+建议升级后依次验证：
+
+```bash
+curl 'http://127.0.0.1:8000/v1/models?availability=all' \
+  -H 'Authorization: Bearer your-api-key'
+
+curl 'http://127.0.0.1:8000/v1/models/status' \
+  -H 'Authorization: Bearer your-api-key'
+```
+
+如果某个目录模型像 `DeepSeek-V4-Flash` 一样在最小请求下返回 `4001`，它会暂时进入 `unavailable`；已经成功的模型（例如你实际验证过的 `minimax-m3`）会进入 `usable`。可以随时用 `DELETE /v1/models/status?model=...` 清除判断并重新尝试。
 
 ## ⬆️ 从 v0.4.0 升级到 v0.4.1
 
@@ -474,7 +548,7 @@ TRAE_OAUTH_PLATFORM=global
 
 - 当前专注 Chat Completions，不实现 embeddings、images、audio、OpenAI Responses API 或多账号池。
 - access token 可以自动刷新，但 refresh token 自身仍可能过期、被撤销或因账号状态变化失效；此时需要重新访问 `/auth/login`。
-- TRAE 登录/Agent 上游并非公开稳定 API。v0.4.2 已把区域、产品、LoginGuidance、Client ID、路径和客户端版本尽可能动态化/可配置，但后续仍可能随 IDE 更新调整。
+- TRAE 登录/Agent 上游并非公开稳定 API。当前版本已把区域、产品、LoginGuidance、Client ID、路径、客户端版本和模型能力状态尽可能动态化/可配置，但后续仍可能随 IDE 更新调整。
 
 ## 📄 License
 
@@ -488,3 +562,9 @@ TRAE Global and TRAE SOLO share the `/api/agent/v3/llm_utils_chat` endpoint but 
 For Global accounts, the default core endpoint is now `https://coresg-normal.trae.ai` for SG and `https://coreva-normal.trae.ai` for US. Existing v0.4.1 managed credentials that contain the generated `trae-api-sg.mchost.guru` or `trae-api-us.mchost.guru` values are migrated automatically on startup; custom `TRAE_API_BASE_URL` overrides are preserved.
 
 After upgrading from v0.4.1, a new browser login is not required. Restart the proxy and retry `/v1/models` and `/v1/chat/completions`.
+
+## v0.4.3 Model availability learning
+
+TRAE 的 `get_detail_param` 目录可能包含当前账号、订阅、产品或区域并不能实际调用的模型，因此“出现在 `/v1/models`”不再被视为已验证可用。v0.4.3 使用被动学习而不是启动时主动探测：最小标准 Chat Completions 成功后记为 `usable`；相同最小形态收到明确的 TRAE `4001` 后短期记为 `unavailable`；额外参数导致的失败不会自动拉黑模型。
+
+默认 `/v1/models` 使用 `availability=available`（`unknown + usable`），负缓存模型会暂时隐藏。`availability=usable` 可得到当前进程中已经真实成功过的模型集合，`availability=all` 可查看完整目录。能力状态是短期内存缓存，不包含 access/refresh token；重启后重新从 `unknown` 学习。

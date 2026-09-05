@@ -8,6 +8,7 @@
 - Access/refresh tokens are never returned by `/status` or `/auth/status` and are not written to normal request logs.
 - OAuth provider error bodies are not copied into public errors/status, reducing the chance of session metadata being echoed into logs.
 - Browser login uses PKCE S256 and one-time in-memory login state; the PKCE verifier is never exposed through status endpoints.
+- Model availability state is account/session-scoped and kept in memory only. `/v1/models/status` exposes model IDs plus bounded upstream error codes/messages, never prompts or TRAE access/refresh credentials; learned state is cleared on logout or process restart.
 
 ## Network exposure
 
@@ -27,4 +28,4 @@
 
 ## Reporting
 
-Please avoid including live account tokens, `.env` files, `data/trae-auth.json`, or captured authorization headers in public issues.
+Please avoid including live account tokens, `.env` files, `data/trae-auth.json`, captured authorization headers, or complete OAuth callback URLs containing `authCodeInfo` in public issues.

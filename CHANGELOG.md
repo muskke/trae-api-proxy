@@ -1,5 +1,31 @@
 # Changelog
 
+All notable changes to this project are documented here.
+
+## v0.4.3
+
+### Added
+
+- Account/session-scoped model capability cache with `unknown`, `usable`, and `unavailable` states.
+- `GET /v1/models/status` diagnostics with function, last error, check time, expiry time, and summary counts.
+- `DELETE /v1/models/status?model=...` (or without `model` for the current session) to clear learned model state and allow an immediate re-check.
+- `availability=available|all|usable|unknown|unavailable` filtering on `GET /v1/models`.
+- `X-Trae-Function` and `X-Trae-Model-Status` diagnostic response headers for chat requests.
+- UTF-8 regression coverage for Chinese OpenAI message content through the current TRAE payload transform.
+
+### Changed
+
+- The default `/v1/models` view now hides models that the current account/session has recently rejected with TRAE `4001` on a minimal standard chat request. Unknown models remain visible until actually exercised.
+- Successful chats mark a model `usable` for 6 hours by default; definitive minimal-request `4001` failures mark it `unavailable` for 30 minutes by default.
+- Complex requests containing extra parameters such as tools or temperature never blacklist a model solely because they receive `4001`; the error is recorded for diagnostics without demoting a known-good model.
+- Model catalog caching is now scoped by account/platform/upstream instead of one process-global model list.
+- Repeated calls to a currently negative-cached model fail locally with `model_unavailable`, avoiding unnecessary upstream traffic until the cache expires or is reset.
+
+### Configuration
+
+- `TRAE_MODEL_FAILURE_TTL` (default `30m`).
+- `TRAE_MODEL_SUCCESS_TTL` (default `6h`).
+
 ## v0.4.2
 
 - Fix Global TRAE model/chat requests to use `chat_v3` instead of the SOLO-only `solo_work_lite` function.
@@ -7,8 +33,6 @@
 - Migrate v0.4.1 generated SG/US core-host values without overwriting explicit custom upstream URLs.
 - Use callback `userRegion` and `host` routing metadata when present.
 - Canonicalize requested model casing from the live model list and add request trace headers used by current TRAE clients.
-
-All notable changes to this project are documented here.
 
 ## [0.4.1] - 2026-09-05
 
