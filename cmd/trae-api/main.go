@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	traeauth "github.com/muskke/trae-api-proxy/internal/auth"
 	"github.com/muskke/trae-api-proxy/internal/config"
 	"github.com/muskke/trae-api-proxy/internal/handler"
 	"github.com/muskke/trae-api-proxy/internal/middleware"
@@ -21,14 +22,26 @@ func main() {
 		log.Fatalf("configuration error: %v", err)
 	}
 
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	authManager := traeauth.NewManager(cfg)
+	defer authManager.CloseIdleConnections()
+	go authManager.Run(ctx)
+
 	traeClient := trae.NewClient(cfg)
 	defer traeClient.CloseIdleConnections()
-	h := handler.NewAPIHandler(cfg, traeClient)
+	h := handler.NewAPIHandler(cfg, traeClient, authManager)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", h.HandleRoot)
 	mux.HandleFunc("GET /healthz", h.HandleHealth)
 	mux.HandleFunc("GET /status", h.HandleStatus)
+	mux.HandleFunc("GET /auth/status", h.HandleAuthStatus)
+	mux.HandleFunc("GET /auth/login", h.HandleAuthLogin)
+	mux.HandleFunc("GET /auth/callback/{state}", h.HandleAuthCallback)
+	mux.HandleFunc("POST /auth/refresh", h.HandleAuthRefresh)
+	mux.HandleFunc("POST /auth/logout", h.HandleAuthLogout)
 	mux.HandleFunc("GET /v1/models", h.HandleModels)
 	mux.HandleFunc("POST /v1/chat/completions", h.HandleChatCompletions)
 
@@ -41,19 +54,31 @@ func main() {
 		middleware.Logger,
 	)
 
-	srv := &http.Server{
-		Addr:              cfg.ListenAddr(),
-		Handler:           wrapped,
-		ReadHeaderTimeout: 10 * time.Second,
-		IdleTimeout:       120 * time.Second,
-		MaxHeaderBytes:    1 << 20,
+	srv := newHTTPServer(cfg.ListenAddr(), wrapped)
+
+	var callbackSrv *http.Server
+	if callbackAddr, localCallback := cfg.OAuthCallbackListenAddr(); localCallback && !cfg.PrimaryServesOAuthCallback() {
+		callbackMux := http.NewServeMux()
+		callbackMux.HandleFunc("GET /auth/callback/{state}", h.HandleAuthCallback)
+		callbackHandler := middleware.Chain(
+			callbackMux,
+			middleware.RequestID,
+			middleware.SecurityHeaders,
+			middleware.Recovery,
+			middleware.Logger,
+		)
+		callbackSrv = newHTTPServer(callbackAddr, callbackHandler)
+		go func() {
+			log.Printf("TRAE OAuth callback listening on %s", callbackAddr)
+			if err := callbackSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Fatalf("OAuth callback listen: %v", err)
+			}
+		}()
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-
 	go func() {
-		log.Printf("trae-api-proxy listening on %s upstream_mode=%s upstream=%s", srv.Addr, cfg.UpstreamMode, cfg.APIBaseURL)
+		authStatus := authManager.Status()
+		log.Printf("trae-api-proxy listening on %s upstream_mode=%s auth_mode=%s auth_source=%s upstream=%s", srv.Addr, cfg.UpstreamMode, cfg.AuthMode, authStatus.Source, cfg.APIBaseURL)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("listen: %v", err)
 		}
@@ -66,5 +91,21 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("graceful shutdown failed: %v", err)
 		_ = srv.Close()
+	}
+	if callbackSrv != nil {
+		if err := callbackSrv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("OAuth callback shutdown failed: %v", err)
+			_ = callbackSrv.Close()
+		}
+	}
+}
+
+func newHTTPServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
 }

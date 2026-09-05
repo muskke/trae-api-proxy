@@ -52,7 +52,7 @@ func TestChatCompletionAutoFallsBackToLegacy(t *testing.T) {
 	defer client.CloseIdleConnections()
 
 	body := []byte(`{"model":"glm-5.2","messages":[{"role":"user","content":"hello"}],"stream":false}`)
-	resp, mode, err := client.ChatCompletion(context.Background(), "upstream-token", "glm-5.2", body)
+	resp, mode, err := client.ChatCompletion(context.Background(), Session{Token: "upstream-token"}, "glm-5.2", body)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,7 +95,7 @@ func TestListModelsAutoFallbackAndCache(t *testing.T) {
 	defer client.CloseIdleConnections()
 
 	for i := 0; i < 2; i++ {
-		models, err := client.ListModels(context.Background(), "token")
+		models, err := client.ListModels(context.Background(), Session{Token: "token"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -131,7 +131,7 @@ func TestSoloModelResponse(t *testing.T) {
 	client := NewClient(cfg)
 	defer client.CloseIdleConnections()
 
-	models, err := client.ListModels(context.Background(), "token")
+	models, err := client.ListModels(context.Background(), Session{Token: "token"})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -23,6 +23,14 @@ const (
 	soloFunction   = "solo_work_lite"
 )
 
+type Session struct {
+	Token     string
+	UID       string
+	MachineID string
+	DeviceID  string
+	Source    string
+}
+
 type Model struct {
 	ID            string `json:"id"`
 	Object        string `json:"object"`
@@ -89,7 +97,7 @@ func (c *Client) CloseIdleConnections() {
 	c.StreamClient.CloseIdleConnections()
 }
 
-func (c *Client) headers(ideToken, accept string) http.Header {
+func (c *Client) headers(session Session, accept string) http.Header {
 	h := make(http.Header)
 	h.Set("Content-Type", "application/json")
 	if accept != "" {
@@ -99,12 +107,12 @@ func (c *Client) headers(ideToken, accept string) http.Header {
 		h.Set("User-Agent", "Trae/"+c.Config.IDEVersion)
 		h.Set("X-Ide-Version", c.Config.IDEVersion)
 	}
-	if ideToken != "" {
-		h.Set("Authorization", "Cloud-IDE-JWT "+ideToken)
-		h.Set("X-Cloudide-Token", ideToken)
-		h.Set("X-Ide-Token", ideToken)
+	if session.Token != "" {
+		h.Set("Authorization", "Cloud-IDE-JWT "+session.Token)
+		h.Set("X-Cloudide-Token", session.Token)
+		h.Set("X-Ide-Token", session.Token)
 	}
-	setIfNotEmpty(h, "X-Uid", c.Config.UID)
+	setIfNotEmpty(h, "X-Uid", firstNonEmpty(session.UID, c.Config.UID))
 	setIfNotEmpty(h, "X-App-Id", c.Config.AppID)
 	setIfNotEmpty(h, "X-App-Version", c.Config.AppVersion)
 	setIfNotEmpty(h, "X-App-Version-Code", c.Config.IDEVersionCode)
@@ -112,12 +120,21 @@ func (c *Client) headers(ideToken, accept string) http.Header {
 	setIfNotEmpty(h, "X-Ide-Version-Type", c.Config.IDEVersionType)
 	setIfNotEmpty(h, "X-Device-Brand", c.Config.DeviceBrand)
 	setIfNotEmpty(h, "X-Device-Cpu", c.Config.DeviceCPU)
-	setIfNotEmpty(h, "X-Device-Id", c.Config.DeviceID)
+	setIfNotEmpty(h, "X-Device-Id", firstNonEmpty(session.DeviceID, c.Config.DeviceID))
 	setIfNotEmpty(h, "X-Device-Type", c.Config.DeviceType)
-	setIfNotEmpty(h, "X-Machine-Id", c.Config.MachineID)
+	setIfNotEmpty(h, "X-Machine-Id", firstNonEmpty(session.MachineID, c.Config.MachineID))
 	setIfNotEmpty(h, "X-OS-Version", c.Config.OSVersion)
 	setIfNotEmpty(h, "Request-Traffic-Type", c.Config.RequestTrafficType)
 	return h
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func setIfNotEmpty(h http.Header, key, value string) {
@@ -126,7 +143,7 @@ func setIfNotEmpty(h http.Header, key, value string) {
 	}
 }
 
-func (c *Client) ListModels(ctx context.Context, ideToken string) ([]Model, error) {
+func (c *Client) ListModels(ctx context.Context, session Session) ([]Model, error) {
 	c.modelMu.RLock()
 	if len(c.modelCache) > 0 && time.Since(c.modelCachedAt) < c.Config.ModelCacheTTL {
 		cached := append([]Model(nil), c.modelCache...)
@@ -136,9 +153,9 @@ func (c *Client) ListModels(ctx context.Context, ideToken string) ([]Model, erro
 	stale := append([]Model(nil), c.modelCache...)
 	c.modelMu.RUnlock()
 
-	models, err := c.fetchModels(ctx, ideToken)
+	models, err := c.fetchModels(ctx, session)
 	if err != nil {
-		if len(stale) > 0 {
+		if len(stale) > 0 && !IsUpstreamAuthError(err) {
 			return stale, nil
 		}
 		return nil, err
@@ -151,22 +168,22 @@ func (c *Client) ListModels(ctx context.Context, ideToken string) ([]Model, erro
 	return models, nil
 }
 
-func (c *Client) fetchModels(ctx context.Context, ideToken string) ([]Model, error) {
+func (c *Client) fetchModels(ctx context.Context, session Session) ([]Model, error) {
 	switch c.Config.UpstreamMode {
 	case "solo":
-		return c.fetchModelsMode(ctx, ideToken, "solo")
+		return c.fetchModelsMode(ctx, session, "solo")
 	case "legacy":
-		return c.fetchModelsMode(ctx, ideToken, "legacy")
+		return c.fetchModelsMode(ctx, session, "legacy")
 	default:
-		models, err := c.fetchModelsMode(ctx, ideToken, "solo")
+		models, err := c.fetchModelsMode(ctx, session, "solo")
 		if err == nil || !canProtocolFallback(err) {
 			return models, err
 		}
-		return c.fetchModelsMode(ctx, ideToken, "legacy")
+		return c.fetchModelsMode(ctx, session, "legacy")
 	}
 }
 
-func (c *Client) fetchModelsMode(ctx context.Context, ideToken, mode string) ([]Model, error) {
+func (c *Client) fetchModelsMode(ctx context.Context, session Session, mode string) ([]Model, error) {
 	var req *http.Request
 	var err error
 
@@ -188,7 +205,7 @@ func (c *Client) fetchModelsMode(ctx context.Context, ideToken, mode string) ([]
 	if err != nil {
 		return nil, err
 	}
-	req.Header = c.headers(ideToken, "application/json")
+	req.Header = c.headers(session, "application/json")
 
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
@@ -257,25 +274,25 @@ func (c *Client) fetchModelsMode(ctx context.Context, ideToken, mode string) ([]
 // ChatCompletion sends an OpenAI-compatible request to the selected upstream
 // protocol. The upstream is always asked for SSE; non-streaming client requests
 // are aggregated by the handler so both modes share the same parser.
-func (c *Client) ChatCompletion(ctx context.Context, ideToken, model string, rawBody []byte) (*http.Response, string, error) {
+func (c *Client) ChatCompletion(ctx context.Context, session Session, model string, rawBody []byte) (*http.Response, string, error) {
 	switch c.Config.UpstreamMode {
 	case "solo":
-		resp, err := c.chatMode(ctx, ideToken, model, rawBody, "solo")
+		resp, err := c.chatMode(ctx, session, model, rawBody, "solo")
 		return resp, "solo", err
 	case "legacy":
-		resp, err := c.chatMode(ctx, ideToken, model, rawBody, "legacy")
+		resp, err := c.chatMode(ctx, session, model, rawBody, "legacy")
 		return resp, "legacy", err
 	default:
-		resp, err := c.chatMode(ctx, ideToken, model, rawBody, "solo")
+		resp, err := c.chatMode(ctx, session, model, rawBody, "solo")
 		if err == nil || !canProtocolFallback(err) {
 			return resp, "solo", err
 		}
-		resp, err = c.chatMode(ctx, ideToken, model, rawBody, "legacy")
+		resp, err = c.chatMode(ctx, session, model, rawBody, "legacy")
 		return resp, "legacy", err
 	}
 }
 
-func (c *Client) chatMode(ctx context.Context, ideToken, model string, rawBody []byte, mode string) (*http.Response, error) {
+func (c *Client) chatMode(ctx context.Context, session Session, model string, rawBody []byte, mode string) (*http.Response, error) {
 	var body []byte
 	var err error
 	path := soloChatPath
@@ -293,7 +310,7 @@ func (c *Client) chatMode(ctx context.Context, ideToken, model string, rawBody [
 	if err != nil {
 		return nil, err
 	}
-	req.Header = c.headers(ideToken, "text/event-stream")
+	req.Header = c.headers(session, "text/event-stream")
 
 	resp, err := c.StreamClient.Do(req)
 	if err != nil {
@@ -305,6 +322,21 @@ func (c *Client) chatMode(ctx context.Context, ideToken, model string, rawBody [
 		return nil, &UpstreamError{Mode: mode, Status: resp.StatusCode, Body: string(raw)}
 	}
 	return resp, nil
+}
+
+func (c *Client) InvalidateModelCache() {
+	c.modelMu.Lock()
+	c.modelCache = nil
+	c.modelCachedAt = time.Time{}
+	c.modelMu.Unlock()
+}
+
+func IsUpstreamAuthError(err error) bool {
+	upstreamErr, ok := err.(*UpstreamError)
+	if !ok {
+		return false
+	}
+	return upstreamErr.Status == http.StatusUnauthorized || upstreamErr.Status == http.StatusForbidden
 }
 
 func canProtocolFallback(err error) bool {
